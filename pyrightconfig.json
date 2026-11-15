@@ -1,0 +1,5 @@
+{
+  "include": ["my-appCleaner"],
+  "typeCheckingMode": "strict",
+  "pythonVersion": "3.9"
+}

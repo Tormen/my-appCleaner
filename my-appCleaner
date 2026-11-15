@@ -1,0 +1,2426 @@
+#!/usr/bin/env python3
+"""my-appCleaner -- uninstall a macOS app with everything it put on the machine.
+
+`show <APP>` lists what an uninstall removes and why each item is there; `rm
+<APP> go` removes it, to the owner's Trash; `intel` lists what has no
+Apple-silicon code; `leftovers` lists Library files whose app is gone.
+`my-appCleaner --help` says how to drive it.
+
+One file, in this order:
+  1. output, errors, config
+  2. the system: commands, users, bundles, receipts, launchd, processes
+  3. the plan: an <APP> -> every item, job and receipt, each with its reason
+  4. verbs: show, rm, intel, leftovers
+  5. cli, main, --run-tests
+"""
+
+from __future__ import annotations
+
+import contextlib
+import datetime
+import fnmatch
+import hashlib
+import io
+import json
+import os
+import platform
+import plistlib
+import pwd
+import re
+import shlex
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import traceback
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from pathlib import Path
+from xml.parsers.expat import ExpatError
+from typing import (
+    Callable,
+    Dict,
+    Final,
+    List,
+    Literal,
+    NoReturn,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    cast,
+)
+
+SCRIPT_NAME: Final = "my-appCleaner"
+SCRIPT_VERSION: Final = "1.0"
+SCRIPT_COMMIT: Final = "unstamped"
+REPOSITORY: Final = "Tormen/my-appCleaner"      # whose tags --version may read as releases
+
+
+# --- 1. output, errors -----------------------------------------------------
+
+class CleanerError(Exception):
+    """The tool's one failure: a code naming the source line, the exit status, what to know."""
+
+    def __init__(self, code: str, text: str, rc: int) -> None:
+        super().__init__(f"{code}: {text}")
+        self.code = code
+        self.text = text
+        self.rc = rc
+
+
+def err(code: str, text: str, rc: int = 1) -> NoReturn:
+    raise CleanerError(code, text, rc)
+
+
+def err_line(code: str, rc: int, text: str) -> str:
+    """The one ERROR line, for the failures main() reports without raising."""
+    return f"ERROR {code} [{rc}]: {text}"
+
+
+class Out:
+    """stdout carries results (lists, plans); narration goes to stderr, silenced by -Q."""
+
+    def __init__(self) -> None:
+        self.quiet = False
+        self.vrb = False
+        self.dbg_on = False
+        self.dbg_file: Optional[Path] = None
+
+    def msg(self, text: str) -> None:
+        if not self.quiet:
+            print(text, file=sys.stderr, flush=True)
+
+    def det(self, text: str) -> None:
+        if self.vrb:
+            self.msg(text)
+
+    def dbg(self, text: str) -> None:
+        if not self.dbg_on:
+            return
+        print(" ~~~ " + text, file=sys.stderr, flush=True)
+        if self.dbg_file is not None:
+            try:
+                with self.dbg_file.open("a", encoding="utf-8") as f:
+                    f.write(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S} {text}\n")
+            except OSError:
+                pass
+
+    def warn(self, text: str) -> None:
+        print("WARNING: " + text, file=sys.stderr, flush=True)
+
+    def error(self, text: str) -> None:
+        print(text, file=sys.stderr, flush=True)
+
+    def result(self, line: str) -> None:
+        print(line, flush=True)
+
+
+OUT = Out()
+_phase = "starting"
+
+
+def phase(text: str) -> None:
+    """What the run is doing now -- the Ctrl-C line names it."""
+    global _phase
+    _phase = text
+    OUT.dbg(f"phase: {text}")
+
+
+def count(n: int) -> str:
+    """4453 -> '4 453'."""
+    return f"{n:,}".replace(",", " ")
+
+
+def human(size: int) -> str:
+    """212000000 -> '212.0 MB'."""
+    f = float(size)
+    for unit in ("B", "KB", "MB"):
+        if f < 1000:
+            return f"{f:.0f} B" if unit == "B" else f"{f:.1f} {unit}"
+        f /= 1000
+    return f"{f:.1f} GB"
+
+
+# --- 1. config -------------------------------------------------------------
+
+DEFAULT_CONFIG: Final = f'''\
+## {SCRIPT_NAME} config -- plain KEY="value" lines, read and never run.
+## A value may name a key above it or $HOME as $NAME; "|" separates list items.
+
+## the commands it calls -- the standard places; "brew" is looked up in PATH
+FILE="/usr/bin/file"
+PKGUTIL="/usr/sbin/pkgutil"
+LAUNCHCTL="/bin/launchctl"
+CODESIGN="/usr/bin/codesign"
+PS="/bin/ps"
+SFLTOOL="/usr/bin/sfltool"
+BREW="brew"
+
+## intel: where it looks (every user's own folders are added), and what it skips
+## (a pattern matches a whole path; a site adds its own program folders here)
+INTEL_ROOTS="/Applications|/Library|/usr/local|/opt"
+INTEL_USER_DIRS="Applications|Library/LaunchAgents|Library/Application Support|Library/PreferencePanes|Library/Services|Library/Audio|Library/QuickLook|Library/Spotlight|Library/Input Methods|Library/Screen Savers|Library/Internet Plug-Ins"
+INTEL_PRUNE="/Library/Developer|/Library/Caches|*/Library/Caches|/opt/homebrew|*/.git"
+
+## rm: one line per item moved to a Trash -- where it came from, where it went
+LOG="$LOG_BASE_DIR/$USER/{SCRIPT_NAME}.log"
+
+## the defaults of -Q / -V / -D ("1" = on)
+QUIET=""
+VRB=""
+DBG=""
+'''
+
+
+@dataclass(frozen=True)
+class Settings:
+    """The config, parsed: every key typed, every default from DEFAULT_CONFIG."""
+
+    files: Tuple[Path, ...]
+    file: str
+    pkgutil: str
+    launchctl: str
+    codesign: str
+    ps: str
+    sfltool: str
+    brew: str
+    intel_roots: Tuple[str, ...]
+    intel_user_dirs: Tuple[str, ...]
+    intel_prune: Tuple[str, ...]
+    log: Path
+    log_base_dir: str
+    quiet: bool
+    vrb: bool
+    dbg: bool
+
+
+_site_conf = Path("/LINKS/default/site.conf")    # the ONE site path in this tool: read_site (tests: their own)
+
+
+@dataclass(frozen=True)
+class Site:
+    """The site's values for every tool, from the site file; without it the
+    neutral ones: /var/db, /var/log, no search directory, no offer."""
+
+    data_base_dir: str = "/var/db"
+    log_base_dir: str = "/var/log"
+    config_search_dir: str = ""
+    config_offer_dir: str = ""
+    config_offer_note: str = ""
+
+
+# python: the text, or None when plainly not there; anything else raises OSError
+def site_conf_text(path: str) -> str | None:
+    try:
+        with open(path) as fh:
+            return fh.read()
+    except FileNotFoundError:
+        if os.path.lexists(path):
+            raise                                # a link to nothing
+        return None
+
+
+def read_site() -> Site:
+    """The site file, read before the config: plain KEY="value" lines. Not
+    there: the neutral values. There but unreadable -- or cannot tell -- an
+    error: the neutral values would keep this user's logs apart from everyone
+    else's."""
+    try:
+        text = site_conf_text(str(_site_conf))
+    except OSError as e:
+        err("001", f"cannot read {_site_conf} ({e.strerror or e}) -- the site's directories for every tool")
+    if text is None:
+        return Site()
+    for n, line in enumerate(text.splitlines(), 1):
+        if ("$" in line or "`" in line) and not line.strip().startswith("#"):
+            err("002", f"{_site_conf}:{n}: a $ or ` -- the site file holds plain KEY=\"value\" lines")
+    names: Dict[str, str] = {}
+    read_config_text(text, str(_site_conf), names)
+    return Site(data_base_dir=names.get("DATA_BASE_DIR") or Site.data_base_dir,
+                log_base_dir=names.get("LOG_BASE_DIR") or Site.log_base_dir,
+                config_search_dir=names.get("CONFIG_SEARCH_DIR", ""),
+                config_offer_dir=names.get("CONFIG_OFFER_DIR", ""),
+                config_offer_note=names.get("CONFIG_OFFER_NOTE", ""))
+
+
+def config_search_paths(site: Site) -> List[Path]:
+    """Where the config is looked for, in order (after $MY_APPCLEANER_CONFIG
+    and --config): the site's search directory, both names, then ~, /etc,
+    /usr/local/etc."""
+    near = Path(site.config_search_dir)
+    return ([near / f"{SCRIPT_NAME}.conf", near / SCRIPT_NAME] if site.config_search_dir else []) + [
+        Path.home() / f".{SCRIPT_NAME}.conf", Path("/etc") / f"{SCRIPT_NAME}.conf",
+        Path("/usr/local/etc") / f"{SCRIPT_NAME}.conf"]
+
+
+def config_offer(site: Site) -> List[Tuple[Path, str]]:
+    """Where to write a config, most common place first, each with its note --
+    built by filtering the search list, so it never names a place not read."""
+    offer: List[Tuple[Path, str]] = []
+    if site.config_offer_dir and site.config_search_dir and site.config_offer_dir != site.config_search_dir:
+        offer.append((Path(site.config_offer_dir) / f"{SCRIPT_NAME}.conf", site.config_offer_note))
+    searched = config_search_paths(site)
+    return offer + [(p, "") for p in (Path("/etc") / f"{SCRIPT_NAME}.conf", Path.home() / f".{SCRIPT_NAME}.conf")
+                    if p in searched]
+
+
+def no_config_offer(site: Site) -> str:
+    lines = "\n".join(f"        > {SCRIPT_NAME} --create-config > {p}" + (f"   ({note})" if note else "")
+                      for p, note in config_offer(site))
+    return (f"no config found -- write one, most common place first:\n{lines}\n"
+            f"    ({SCRIPT_NAME} --help lists every place it is looked for)")
+
+
+_KEY_LINE: Final = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+_NAME_REF: Final = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
+
+
+def _expand(text: str, names: Dict[str, str], where: str) -> str:
+    if "$(" in text or "`" in text:
+        err("003", f"{where}: a command substitution -- {SCRIPT_NAME} reads its config, it never runs it")
+
+    def one(m: re.Match[str]) -> str:
+        name = m.group(1) or m.group(2)
+        if name in names:
+            return names[name]
+        if name == "HOME":
+            return str(Path.home())
+        err("004", f"{where}: ${name} is not set (a key above it, or HOME)")
+
+    return _NAME_REF.sub(one, text)
+
+
+def parse_value(raw: str, names: Dict[str, str], where: str) -> str:
+    """One shell word: unquoted, "double" ($ expanded) and 'single' parts, a
+    leading ~ as $HOME, then nothing but a # comment."""
+    out: List[str] = []
+    i = 0
+    while i < len(raw):
+        c = raw[i]
+        if c == "'":
+            j = raw.find("'", i + 1)
+            if j < 0:
+                err("005", f"{where}: a ' is not closed")
+            out.append(raw[i + 1:j])
+            i = j + 1
+        elif c == '"':
+            j = i + 1
+            part: List[str] = []
+            while j < len(raw) and raw[j] != '"':
+                if raw[j] == "\\" and j + 1 < len(raw) and raw[j + 1] in '"\\$`':
+                    j += 1
+                part.append(raw[j])
+                j += 1
+            if j >= len(raw):
+                err("006", f"{where}: a \" is not closed")
+            out.append(_expand("".join(part), names, where))
+            i = j + 1
+        elif c in " \t":
+            rest = raw[i:].strip()
+            if rest and not rest.startswith("#"):
+                err("007", f"{where}: more than one word -- quote the value")
+            break
+        else:
+            m = re.match(r"[^'\" \t]+", raw[i:])
+            assert m is not None, "c is none of the characters the word stops at"
+            word = m.group(0)
+            i += len(word)
+            if not out and (word == "~" or word.startswith("~/")):
+                word = str(Path.home()) + word[1:]
+            out.append(_expand(word, names, where))
+    return "".join(out)
+
+
+def read_config_text(text: str, where: str, names: Dict[str, str]) -> List[str]:
+    """Add the KEY=value lines of `text` to `names`; return the keys it set."""
+    keys: List[str] = []
+    for n, line in enumerate(text.splitlines(), 1):
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        m = _KEY_LINE.match(s)
+        if m is None:
+            err("008", f"{where}:{n}: not a KEY=\"value\" line -- {SCRIPT_NAME} reads its config, it never runs it: {s[:60]}")
+        names[m.group(1)] = parse_value(m.group(2), names, f"{where}:{n}")
+        keys.append(m.group(1))
+    return keys
+
+
+def _flag(value: str, key: str, where: str) -> bool:
+    if value in ("", "0"):
+        return False
+    if value == "1":
+        return True
+    err("009", f"{where}: {key}=\"{value}\" -- \"1\" (on) or \"\" (off)")
+
+
+def _list(value: str) -> Tuple[str, ...]:
+    return tuple(v for v in value.split("|") if v)
+
+
+def load_settings(override: Optional[str]) -> Settings:
+    """The config: the defaults, then the site's global file (<name>.GLOBAL,
+    only in the site's search directory), then the one found on top."""
+    phase("reading the config")
+    site = read_site()
+    names: Dict[str, str] = {"DATA_BASE_DIR": site.data_base_dir, "LOG_BASE_DIR": site.log_base_dir,
+                             "USER": pwd.getpwuid(_geteuid()).pw_name}
+    defaults = read_config_text(DEFAULT_CONFIG, "the built-in defaults", names)
+    chosen = override or os.environ.get("MY_APPCLEANER_CONFIG")
+    if chosen:
+        if not Path(chosen).is_file():
+            err("010", f"config '{chosen}' not found (--config / $MY_APPCLEANER_CONFIG)")
+        found = Path(chosen)
+    else:
+        hits = [p for p in config_search_paths(site) if p.is_file()]
+        if not hits:
+            err("011", no_config_offer(site))
+        found = hits[0]
+    files = [found]
+    if site.config_search_dir and found.parent == Path(site.config_search_dir):
+        files = [p for p in (found.with_name(found.name + ".GLOBAL"), found) if p.is_file()]
+    for p in files:
+        try:
+            text = p.read_text(encoding="utf-8")
+        except OSError as e:
+            err("012", f"cannot read the config {p}: {e.strerror}")
+        for key in read_config_text(text, str(p), names):
+            if key not in defaults:
+                OUT.warn(f"{p}: {key} is not a {SCRIPT_NAME} setting -- ignored ('{SCRIPT_NAME} --create-config' lists them)")
+    where = " + ".join(str(p) for p in files)
+    return Settings(
+        files=tuple(files), file=names["FILE"], pkgutil=names["PKGUTIL"], launchctl=names["LAUNCHCTL"],
+        codesign=names["CODESIGN"], ps=names["PS"], sfltool=names["SFLTOOL"], brew=names["BREW"],
+        intel_roots=_list(names["INTEL_ROOTS"]), intel_user_dirs=_list(names["INTEL_USER_DIRS"]),
+        intel_prune=_list(names["INTEL_PRUNE"]), log=Path(names["LOG"]), log_base_dir=site.log_base_dir,
+        quiet=_flag(names["QUIET"], "QUIET", where), vrb=_flag(names["VRB"], "VRB", where),
+        dbg=_flag(names["DBG"], "DBG", where))
+
+
+# --- 2. the system -----------------------------------------------------------
+
+_root = Path("/")                      # where the system's folders are: a test's own tree in --run-tests
+_geteuid: Callable[[], int] = os.geteuid
+_kill: Callable[[int, int], None] = os.kill
+
+
+def R(path: str) -> Path:
+    """A system path, under the root the run looks at."""
+    return _root / path.lstrip("/")
+
+
+def shown(p: Path) -> str:
+    """A path as the user knows it: the system's, without a test's root."""
+    if _root == Path("/"):
+        return str(p)
+    try:
+        return "/" + str(p.relative_to(_root))
+    except ValueError:
+        return str(p)
+
+
+def call(argv: Sequence[str], timeout: float = 120, user: Optional[int] = None,
+         env_extra: Optional[Dict[str, str]] = None) -> Tuple[int, str, str]:
+    """A command, bytes read as bytes (LC_ALL=C): rc, stdout, stderr. A command
+    that is not there answers rc 127, never an exception."""
+    OUT.dbg(f"call: {shlex.join(argv)}")
+    env = dict(os.environ, LC_ALL="C", **(env_extra or {}))
+    gid: Optional[int] = None
+    groups: Optional[List[int]] = None
+    if user is not None:
+        pw = pwd.getpwuid(user)
+        env.update(HOME=pw.pw_dir, USER=pw.pw_name, LOGNAME=pw.pw_name)
+        gid, groups = pw.pw_gid, []
+    try:
+        r = subprocess.run(list(argv), capture_output=True, check=False, timeout=timeout, env=env, user=user, group=gid,
+                           extra_groups=groups)
+    except FileNotFoundError:
+        return 127, "", f"{argv[0]}: not found"
+    except subprocess.TimeoutExpired:
+        return 124, "", f"{argv[0]}: no answer within {timeout:.0f}s"
+    return (r.returncode, r.stdout.decode("utf-8", "surrogateescape"),
+            r.stderr.decode("utf-8", "surrogateescape"))
+
+
+@dataclass(frozen=True)
+class Home:
+    name: str
+    path: Path
+    uid: int
+
+
+def homes() -> List[Home]:
+    """Every user's home: the folders in /Users, Shared left out."""
+    out: List[Home] = []
+    try:
+        entries = sorted(R("Users").iterdir())
+    except OSError:
+        return out
+    for h in entries:
+        if h.name == "Shared" or h.name.startswith(".") or not h.is_dir() or h.is_symlink():
+            continue
+        try:
+            out.append(Home(h.name, h, h.stat().st_uid))
+        except OSError:
+            continue
+    return out
+
+
+def home_label(p: Path, hs: Sequence[Home]) -> str:
+    """~me/Library/... for a path in a home, else the path."""
+    for h in hs:
+        if p == h.path:
+            return f"~{h.name}"
+        if h.path in p.parents:
+            return f"~{h.name}/{p.relative_to(h.path)}"
+    return shown(p)
+
+
+def inside(p: Path, roots: Sequence[Path]) -> bool:
+    """P is one of ROOTS or below one."""
+    s = str(p)
+    return any(s == str(r) or s.startswith(str(r).rstrip("/") + "/") for r in roots)
+
+
+def readable(d: Path) -> bool:
+    try:
+        next(iter(os.scandir(d)), None)
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+
+def listdir(d: Path) -> List[Path]:
+    try:
+        return sorted(d / n for n in os.listdir(d))
+    except OSError:
+        return []
+
+
+def size_of(p: Path) -> int:
+    """Bytes on disk, the whole tree; a link counts as itself."""
+    try:
+        st = p.lstat()
+    except OSError:
+        return 0
+    total = st.st_blocks * 512
+    if p.is_dir() and not p.is_symlink():
+        for dirpath, dirnames, filenames in os.walk(p):
+            for n in dirnames + filenames:
+                try:
+                    total += os.lstat(os.path.join(dirpath, n)).st_blocks * 512
+                except OSError:
+                    pass
+    return total
+
+
+BUNDLE_EXT: Final = re.compile(r"\.(app|bundle|plugin|framework|prefPane|component|kext|qlgenerator|mdimporter|saver|"
+                               r"systemextension|driver|appex|xpc|vst|vst3)$")
+
+
+def plist_dict(source: Path | bytes) -> Dict[str, object]:
+    """A plist's top dict, from a file or from bytes; {} when it is not one --
+    unreadable, malformed (XML that expat refuses, a broken binary), or no
+    dict at the top. Vendors ship broken plists: one never stops a run."""
+    try:
+        if isinstance(source, bytes):
+            data = cast(object, plistlib.loads(source))
+        else:
+            with source.open("rb") as f:
+                data = cast(object, plistlib.load(f))
+    except (OSError, ValueError, ExpatError) as e:   # InvalidFileException is a ValueError
+        OUT.dbg(f"not a plist: {source if isinstance(source, Path) else 'pkgutil output'}: {e}")
+        return {}
+    return cast(Dict[str, object], data) if isinstance(data, dict) else {}
+
+
+def info_plist(bundle: Path) -> Dict[str, object]:
+    for p in (bundle / "Contents" / "Info.plist", bundle / "Info.plist"):
+        d = plist_dict(p)
+        if d:
+            return d
+    return {}
+
+
+def bundle_id(bundle: Path) -> str:
+    v = info_plist(bundle).get("CFBundleIdentifier")
+    return v if isinstance(v, str) else ""
+
+
+def main_executable(app: Path) -> Path:
+    v = info_plist(app).get("CFBundleExecutable")
+    return app / "Contents" / "MacOS" / (v if isinstance(v, str) else app.stem)
+
+
+def apps_in(folder: Path, depth: int = 4) -> List[Path]:
+    """The .app bundles in FOLDER, not those inside another app."""
+    found: List[Path] = []
+    if folder.suffix == ".app":
+        return [folder]
+    if depth == 0:
+        return found
+    for p in listdir(folder):
+        if p.is_symlink() or not p.is_dir():
+            continue
+        if p.suffix == ".app":
+            found.append(p)
+        elif not BUNDLE_EXT.search(p.name):
+            found.extend(apps_in(p, depth - 1))
+    return found
+
+
+def app_dirs() -> List[Path]:
+    return [R("Applications")] + [h.path / "Applications" for h in homes()]
+
+
+class System:
+    """What the run asks the machine, each answer asked once."""
+
+    def __init__(self, s: Settings) -> None:
+        self.s = s
+        self._teams: Dict[Path, str] = {}
+        self._receipts: Optional[Dict[str, Receipt]] = None
+        self._casks: Optional[Dict[Path, str]] = None
+        self._jobs: Optional[List[Job]] = None
+        self._apps: Optional[List[Path]] = None
+
+    def team(self, p: Path) -> str:
+        """The team id that signed P, '' when none."""
+        if p not in self._teams:
+            _, _, e = call([self.s.codesign, "-dv", str(p)], timeout=60)
+            m = re.search(r"^TeamIdentifier=(\S+)", e, re.MULTILINE)
+            self._teams[p] = m.group(1) if m and m.group(1) != "not" else ""
+        return self._teams[p]
+
+    def installed_apps(self) -> List[Path]:
+        if self._apps is None:
+            self._apps = [a for d in app_dirs() for a in apps_in(d)]
+        return self._apps
+
+    def receipts(self) -> Dict[str, Receipt]:
+        """Every installer receipt but Apple's: its id and the full paths it installed."""
+        if self._receipts is None:
+            phase("reading the installer receipts")
+            rc, out, e = call([self.s.pkgutil, "--pkgs"])
+            if rc != 0:
+                err("013", f"pkgutil --pkgs failed [rc {rc}]: {e.strip()[:200]}")
+            ids = [i for i in out.split() if not i.startswith("com.apple.")]
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                self._receipts = {r.id: r for r in pool.map(self.receipt_of, ids)}
+        return self._receipts
+
+    def receipt_of(self, pkg: str) -> Receipt:
+        rc, out, _ = call([self.s.pkgutil, "--pkg-info-plist", pkg])
+        base = R("/")
+        if rc == 0:
+            d = plist_dict(out.encode("utf-8", "surrogateescape"))
+            vol, loc = d.get("volume", "/"), d.get("install-location", "")
+            base = R(vol if isinstance(vol, str) else "/") / (loc if isinstance(loc, str) else "").lstrip("/")
+        rc, out, _ = call([self.s.pkgutil, "--files", pkg])
+        files = frozenset(Path(os.path.normpath(base / f)) for f in out.splitlines() if f and f != ".")
+        return Receipt(pkg, files)
+
+    def casks(self) -> Dict[Path, str]:
+        """Homebrew's casks by the app path each installed: path -> cask token."""
+        if self._casks is None:
+            self._casks = {}
+            phase("asking Homebrew for its casks")
+            rc, out, _ = brew(self.s, "info", "--json=v2", "--installed", "--cask")
+            if rc == 0:
+                self._casks = parse_casks(out)
+            else:
+                OUT.dbg(f"no casks: brew [rc {rc}]")
+        return self._casks
+
+    def jobs(self) -> List[Job]:
+        """Every launchd job of the system and of each user, with where it is loaded."""
+        if self._jobs is None:
+            phase("reading the launchd jobs")
+            self._jobs = []
+            hs = homes()
+            places: List[Tuple[Path, Optional[Home], bool]] = [
+                (R("Library/LaunchDaemons"), None, True), (R("Library/LaunchAgents"), None, False)]
+            places += [(h.path / "Library" / "LaunchAgents", h, False) for h in hs]
+            for folder, home, daemon in places:
+                for p in listdir(folder):
+                    if p.suffix != ".plist":
+                        continue
+                    pl = plist_dict(p)
+                    if not pl:
+                        continue
+                    label = pl.get("Label")
+                    label = label if isinstance(label, str) else p.stem
+                    prog = pl.get("Program")
+                    args = pl.get("ProgramArguments")
+                    if not isinstance(prog, str) and isinstance(args, list) and args:
+                        prog = cast(List[object], args)[0]
+                    program = R(prog) if isinstance(prog, str) and prog.startswith("/") else None
+                    if daemon:
+                        domains = [f"system/{label}"]
+                    elif home is not None:
+                        domains = [f"gui/{home.uid}/{label}"]
+                    else:
+                        domains = [f"gui/{h.uid}/{label}" for h in hs]
+                    self._jobs.append(Job(p, label, program, tuple(dict.fromkeys(domains))))
+        return self._jobs
+
+    def loaded(self, job: Job) -> Tuple[List[str], bool]:
+        """Where JOB is loaded now, and whether it runs."""
+        where: List[str] = []
+        running = False
+        for d in job.domains:
+            rc, out, _ = call([self.s.launchctl, "print", d], timeout=30)
+            if rc == 0:
+                where.append(d)
+                running = running or re.search(r"^\s*state = running", out, re.MULTILINE) is not None
+        return where, running
+
+    def processes(self) -> List[Tuple[int, Path]]:
+        rc, out, _ = call([self.s.ps, "-axo", "pid=,comm="])
+        procs: List[Tuple[int, Path]] = []
+        for line in out.splitlines() if rc == 0 else []:
+            pid, _, comm = line.strip().partition(" ")
+            comm = comm.strip()
+            if pid.isdigit() and comm.startswith("/") and int(pid) != os.getpid():
+                procs.append((int(pid), R(comm)))
+        return procs
+
+    def login_items(self) -> List[Path]:
+        """The background and login items macOS knows (root only: sfltool)."""
+        if _geteuid() != 0:
+            return []
+        rc, out, _ = call([self.s.sfltool, "dumpbtm"], timeout=60)
+        found: Set[Path] = set()
+        for line in out.splitlines() if rc == 0 else []:
+            m = re.match(r"^\s*(?:Executable Path|URL):\s*(?:file://)?(/.*?)/?\s*$", line)
+            if m:
+                found.add(R(m.group(1).replace("%20", " ")))
+        return sorted(found)
+
+
+def parse_casks(text: str) -> Dict[Path, str]:
+    """brew info --json=v2: each cask's app target -> its token."""
+    found: Dict[Path, str] = {}
+    try:
+        data = cast(object, json.loads(text))
+    except ValueError:
+        return found
+    casks = cast(Dict[str, object], data).get("casks") if isinstance(data, dict) else None
+    for c in cast(List[object], casks) if isinstance(casks, list) else []:
+        if not isinstance(c, dict):
+            continue
+        token = cast(Dict[str, object], c).get("token")
+        arts = cast(Dict[str, object], c).get("artifacts")
+        for a in cast(List[object], arts) if isinstance(arts, list) else []:
+            target = cast(Dict[str, object], a).get("target") if isinstance(a, dict) else None
+            if isinstance(token, str) and isinstance(target, str) and target.endswith(".app"):
+                found[R(target)] = token
+    return found
+
+
+def brew(s: Settings, *args: str, timeout: float = 120) -> Tuple[int, str, str]:
+    """Homebrew, as its owner when run as root, without its auto-update: an
+    update is not asked for, and one that cannot take its lock fails a
+    look that had its answer (exit 1 beside complete JSON)."""
+    return call([s.brew, *args], timeout=timeout, user=brew_user(s), env_extra={"HOMEBREW_NO_AUTO_UPDATE": "1"})
+
+
+def brew_user(s: Settings) -> Optional[int]:
+    """As root, Homebrew runs as the owner of its own brew, never as root."""
+    if _geteuid() != 0:
+        return None
+    exe = s.brew if "/" in s.brew else next(
+        (os.path.join(d, s.brew) for d in os.environ.get("PATH", "").split(":") if os.access(os.path.join(d, s.brew), os.X_OK)), "")
+    try:
+        owner = os.stat(os.path.realpath(exe)).st_uid if exe else None
+    except OSError:
+        return None
+    return owner if owner != os.getuid() else None
+
+
+@dataclass(frozen=True)
+class Receipt:
+    id: str
+    files: frozenset[Path]
+
+
+@dataclass(frozen=True)
+class Job:
+    plist: Path
+    label: str
+    program: Optional[Path]
+    domains: Tuple[str, ...]      # where it would be loaded: system/<label>, gui/<uid>/<label>
+
+
+# --- 3. the plan -----------------------------------------------------------
+
+Section = Literal["apps", "items", "launchd", "helpers", "extensions", "library", "receipts"]
+WhyKind = Literal["given", "in the folder", "same bundle id", "bundle id", "team id", "receipt", "program in item",
+                  "inside item"]
+
+
+@dataclass(frozen=True)
+class Why:
+    kind: WhyKind
+    detail: str = ""
+
+    def __str__(self) -> str:
+        return f"{self.kind} {self.detail}" if self.detail else self.kind
+
+
+@dataclass(frozen=True)
+class Item:
+    path: Path
+    section: Section
+    why: Why
+
+
+LIBRARY_DIRS: Final = ("Application Support", "Caches", "Preferences", "Preferences/ByHost", "Containers",
+                       "Group Containers", "Saved Application State", "HTTPStorages", "WebKit", "Logs", "Cookies",
+                       "Application Scripts")
+EXTENSION_DIRS: Final = ("Extensions", "Audio/Plug-Ins/HAL", "Audio/Plug-Ins/Components", "Audio/Plug-Ins/VST",
+                         "Audio/Plug-Ins/VST3", "QuickLook", "Spotlight", "PreferencePanes", "Printers",
+                         "Image Capture/Devices", "Internet Plug-Ins", "Input Methods", "Screen Savers", "Services")
+HELPER_DIR: Final = "Library/PrivilegedHelperTools"
+# where an installer puts things: an item of a receipt is the entry right below
+# the nearest of these -- a vendor's folder, a program, a bundle
+PLACES: Final = (("Applications", "Library", HELPER_DIR, "Library/LaunchAgents", "Library/LaunchDaemons",
+                  "Library/Frameworks", "Library/Fonts", "Library/Printers/PPDs/Contents/Resources",
+                  "Library/ColorSync/Profiles", "Library/Contextual Menu Items", "Library/Audio/MIDI Drivers",
+                  "usr/local", "usr/local/bin", "usr/local/sbin", "usr/local/lib", "usr/local/libexec",
+                  "usr/local/share", "usr/local/include", "usr/local/etc", "opt")
+                 + tuple(f"Library/{d}" for d in LIBRARY_DIRS + EXTENSION_DIRS))
+NEVER: Final = ("System", "usr", "bin", "sbin", "private", "etc", "var", "dev", "cores", "Volumes", "Users")
+WALK_LIMIT: Final = 20000      # entries walked to prove a folder holds nothing but a receipt's files
+
+
+def places() -> List[Path]:
+    return [R(p) for p in PLACES]
+
+
+_guarded: Dict[Path, List[Path]] = {}
+
+
+def guarded() -> List[Path]:
+    """The folders never removed, nor anything holding one -- once per run (per root)."""
+    if _root not in _guarded:
+        g = [R(n) for n in NEVER] + places()
+        for h in homes():
+            g += [h.path, h.path / "Library", h.path / "Applications"]
+            g += [h.path / "Library" / d for d in LIBRARY_DIRS + EXTENSION_DIRS + ("LaunchAgents",)]
+        _guarded[_root] = g
+    return _guarded[_root]
+
+
+def protected(p: Path) -> Optional[str]:
+    """Why P may never be removed, or None: macOS's own, a place things are
+    installed into, a home or its Library, or anything holding one."""
+    rel = shown(p).lstrip("/")
+    if not rel:
+        return "the whole system"
+    first = rel.split("/")[0]
+    if first in ("System", "bin", "sbin", "dev", "cores") or (first == "usr" and not rel.startswith("usr/local")):
+        return "part of macOS"
+    for g in guarded():
+        if p == g or p in g.parents:
+            return f"{'it is' if p == g else 'it holds'} {home_label(g, homes())}, a folder things are installed into"
+    return None
+
+
+def id_match(name: str, ids: Set[str]) -> str:
+    """The id NAME belongs to: the name is the id, or the id then a dot
+    (com.example.App.plist) -- '' when none. A name alone matches nothing."""
+    n = name.lower()
+    n = n.removeprefix("group.")
+    for i in ids:
+        if n == i or n.startswith(i + "."):
+            return i
+    return ""
+
+
+@dataclass
+class Plan:
+    """What an uninstall of the given <APP>s removes, each item with its reason."""
+
+    given: List[str]
+    items: Dict[Path, Item] = field(default_factory=lambda: {})
+    jobs: Dict[Path, Tuple[Job, Why, List[str], bool]] = field(default_factory=lambda: {})  # plist -> job, why, loaded, running
+    receipts: Dict[str, List[Path]] = field(default_factory=lambda: {})      # id -> its files kept (shared folders)
+    bundle_ids: Set[str] = field(default_factory=lambda: set())
+    short_ids: Set[str] = field(default_factory=lambda: set())
+    teams: Set[str] = field(default_factory=lambda: set())
+    team_kept: Dict[str, List[Path]] = field(default_factory=lambda: {})     # team -> other apps it signs
+    team_kept_items: List[Path] = field(default_factory=lambda: [])
+    casks: Dict[str, Path] = field(default_factory=lambda: {})
+    login_items: List[Path] = field(default_factory=lambda: [])
+    unreadable: List[Path] = field(default_factory=lambda: [])
+
+    def add(self, p: Path, section: Section, why: Why) -> None:
+        if p not in self.items:
+            self.items[p] = Item(p, section, why)
+
+    def roots(self) -> List[Path]:
+        """The items not inside another item: what is moved."""
+        out: List[Path] = []
+        for p in sorted(self.items, key=lambda x: len(x.parts)):
+            if not inside(p, out):
+                out.append(p)
+        return out
+
+    def apps(self) -> List[Path]:
+        return [i.path for i in self.items.values() if i.section == "apps"]
+
+
+def resolve(sysm: System, plan: Plan, arg: str) -> None:
+    """One <APP>: an .app, a folder of apps, a bundle id, a package id, or any other path."""
+    phase(f"looking up {arg}")
+    if arg.startswith(("/", ".")) or "/" in arg:
+        p = Path(os.path.abspath(arg))
+        p = R(str(p)) if _root != Path("/") and not str(p).startswith(str(_root)) else p
+        if not p.exists() and not p.is_symlink():
+            err("014", f"{arg}: not found")
+        why = protected(p)
+        if why:
+            err("015", f"{arg}: never removed -- {why}")
+        if p.suffix == ".app":
+            plan.add(p, "apps", Why("given"))
+            return
+        apps = apps_in(p) if p.is_dir() and not BUNDLE_EXT.search(p.name) else []
+        plan.add(p, "items", Why("given"))
+        for a in apps:
+            plan.add(a, "apps", Why("in the folder"))
+        return
+    if arg.lower().startswith("com.apple."):
+        err("016", f"{arg}: part of macOS -- never removed")
+    rc, _, _ = call([sysm.s.pkgutil, "--pkg-info", arg])
+    if rc == 0:
+        plan.receipts.setdefault(arg, [])
+        return
+    hits = [a for a in sysm.installed_apps() if bundle_id(a).lower() == arg.lower()]
+    if not hits:
+        err("017", f"{arg}: no app with that bundle id and no receipt with that package id "
+                   f"(an <APP> is a path, a bundle id or a package id)")
+    for a in hits:
+        plan.add(a, "apps", Why("given", f"({arg})"))
+
+
+def make_plan(sysm: System, args: Sequence[str]) -> Plan:
+    """Every <APP> resolved, then what belongs to them: other copies, receipts,
+    launchd jobs, helpers, extensions, Library files -- in that order, each
+    step seeing what the steps before it found."""
+    plan = Plan(list(args))
+    for a in args:
+        resolve(sysm, plan, a)
+    hs = homes()
+    plan.unreadable = [h.path / "Library" for h in hs if not readable(h.path / "Library")]
+
+    phase("reading the apps' bundle ids and team ids")
+    for app in plan.apps():
+        bid = bundle_id(app)
+        if bid.lower().startswith("com.apple."):
+            err("018", f"{shown(app)}: bundle id {bid} -- part of macOS, never removed")
+        if bid:
+            (plan.bundle_ids if bid.count(".") >= 2 else plan.short_ids).add(bid.lower())
+        team = sysm.team(app)
+        if team:
+            plan.teams.add(team)
+    for other in sysm.installed_apps():
+        if other not in plan.items and bundle_id(other).lower() in plan.bundle_ids | plan.short_ids:
+            plan.add(other, "apps", Why("same bundle id"))
+    _team_guard(sysm, plan)
+    teams = plan.teams - set(plan.team_kept)
+
+    for app, token in ((a, sysm.casks().get(a)) for a in plan.apps()):
+        if token:
+            plan.casks[token] = app
+
+    # receipts: every package that installed something inside an item, and its other files
+    phase("matching the installer receipts")
+    receipts = sysm.receipts()
+    roots = list(plan.items)
+    for r in receipts.values():
+        if r.id in plan.receipts or any(inside(f, roots) for f in r.files):
+            plan.receipts.setdefault(r.id, [])
+    for rid in list(plan.receipts):
+        if rid not in receipts:
+            receipts[rid] = sysm.receipt_of(rid)
+    _receipt_items(plan, [receipts[i] for i in plan.receipts])
+
+    phase("matching launchd jobs, helpers, extensions and Library files")
+    item_roots = list(plan.items)
+    receipt_files = {f for i in plan.receipts for f in receipts[i].files}
+    for job in sysm.jobs():
+        why: Optional[Why] = None
+        if job.program is not None and inside(job.program, item_roots):
+            why = Why("program in item")
+        elif job.plist in receipt_files or inside(job.plist, item_roots):
+            why = Why("receipt")
+        elif id_match(job.label, plan.bundle_ids) or id_match(job.plist.name, plan.bundle_ids):
+            why = Why("bundle id")
+        elif teams and job.program is not None and job.program.exists() and sysm.team(job.program) in teams:
+            why = Why("team id", sysm.team(job.program))
+        if why is not None:
+            where, running = sysm.loaded(job)
+            plan.jobs[job.plist] = (job, why, where, running)
+            plan.add(job.plist, "launchd", why)
+    for h in listdir(R(HELPER_DIR)):
+        _match_bundle(sysm, plan, h, "helpers", teams)
+    for lib in [R("Library")] + [x.path / "Library" for x in hs]:
+        for d in EXTENSION_DIRS:
+            for e in listdir(lib / d):
+                _match_bundle(sysm, plan, e, "extensions", teams)
+        for d in LIBRARY_DIRS:
+            for e in listdir(lib / d):
+                if e.is_dir() and e.name == "ByHost":
+                    continue
+                if id_match(e.name, plan.bundle_ids):
+                    plan.add(e, "library", Why("bundle id"))
+                elif d == "Group Containers" and any(e.name.startswith(t + ".") for t in plan.teams):
+                    team = e.name.split(".")[0]
+                    if team in teams:
+                        plan.add(e, "library", Why("team id", team))
+                    else:
+                        plan.team_kept_items.append(e)
+    roots = list(plan.items)
+    plan.login_items = [x for x in sysm.login_items() if inside(x, roots)]
+    for p in plan.items:
+        why2 = protected(p)
+        if why2:
+            err("019", f"{shown(p)} ({plan.items[p].why}) is never removed -- {why2}")
+    return plan
+
+
+def _team_guard(sysm: System, plan: Plan) -> None:
+    """A team id signs more than the apps given: the other apps it signs keep
+    what only the team id would have matched."""
+    if not plan.teams:
+        return
+    phase("checking which other apps the team ids sign")
+    for other in sysm.installed_apps():
+        if other in plan.items:
+            continue
+        t = sysm.team(other)
+        if t in plan.teams:
+            plan.team_kept.setdefault(t, []).append(other)
+
+
+def _match_bundle(sysm: System, plan: Plan, p: Path, section: Section, teams: Set[str]) -> None:
+    if p in plan.items:
+        return
+    if id_match(p.name, plan.bundle_ids) or id_match(bundle_id(p), plan.bundle_ids):
+        plan.add(p, section, Why("bundle id"))
+        return
+    if plan.teams and (BUNDLE_EXT.search(p.name) or p.is_file()):
+        t = sysm.team(p)
+        if t in teams:
+            plan.add(p, section, Why("team id", t))
+        elif t in plan.teams:
+            plan.team_kept_items.append(p)
+
+
+def receipt_top(f: Path, ps: Sequence[Path]) -> Optional[Path]:
+    """The entry right below the nearest place F is in -- what a receipt's file belongs to."""
+    best: Optional[Path] = None
+    for pl in ps:
+        if pl in f.parents and (best is None or len(pl.parts) > len(best.parts)):
+            best = pl
+    if best is None:
+        return None
+    return best / f.relative_to(best).parts[0]
+
+
+def _receipt_items(plan: Plan, receipts: Sequence[Receipt]) -> None:
+    """Each receipt's files, grouped by their top entry: a top already an item,
+    or holding nothing but files of these receipts, is removed; any other top
+    is a shared folder, kept -- and its receipt is then not forgotten."""
+    allfiles: Set[Path] = {f for r in receipts for f in r.files}
+    ps = places()
+    tops: Dict[Path, bool] = {}
+    for r in receipts:
+        kept: List[Path] = []
+        for f in sorted(r.files):
+            if not (f.exists() or f.is_symlink()) or any(f == g or inside(g, [f]) for g in guarded()):
+                continue                       # gone, or a system folder the package only lists
+            top = receipt_top(f, ps)
+            if top is None:
+                kept.append(f)
+                continue
+            if inside(top, list(plan.items)) or inside(f, list(plan.items)):
+                continue
+            if top not in tops:
+                tops[top] = _only_these(top, allfiles) and protected(top) is None
+                if tops[top]:
+                    plan.add(top, "receipts", Why("receipt", r.id))
+            if not tops[top]:
+                kept.append(f)
+        plan.receipts[r.id] = kept
+
+
+def _only_these(top: Path, files: Set[Path]) -> bool:
+    if top not in files:
+        return False
+    if not top.is_dir() or top.is_symlink():
+        return True
+    n = 0
+    for dirpath, dirnames, filenames in os.walk(top):
+        for name in dirnames + filenames:
+            n += 1
+            if n > WALK_LIMIT or Path(dirpath, name) not in files:
+                return False
+    return True
+
+
+# --- 4. verbs ----------------------------------------------------------------
+
+LISTED: Final[Tuple[Section, ...]] = ("helpers", "extensions", "library", "receipts")
+SECTION_TITLE: Final[Dict[Section, str]] = {
+    "launchd": "launchd", "helpers": "helpers", "extensions": "extensions", "library": "Library files",
+    "receipts": "receipt files"}
+
+
+def owner_of(p: Path) -> int:
+    try:
+        return p.lstat().st_uid
+    except OSError:
+        return 0
+
+
+def user_name(uid: int) -> str:
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return str(uid)
+
+
+def print_plan(plan: Plan) -> None:
+    """The plan, by section: the counts first, then one line per item with its reason."""
+    hs = homes()
+    width = 66
+    by: Dict[Section, List[Item]] = {}
+    for it in sorted(plan.items.values(), key=lambda i: str(i.path)):
+        by.setdefault(it.section, []).append(it)
+
+    def line(p: Path, why: str) -> None:
+        OUT.result(f"   > {home_label(p, hs):<{width}} [{why}]")
+
+    head: List[str] = []
+    apps, others = by.get("apps", []), by.get("items", [])
+    if apps:
+        head.append(f"{len(apps)} app(s)")
+    if others:
+        head.append(f"{len(others)} item(s)")
+    if plan.teams:
+        head.append("team id " + ", ".join(sorted(plan.teams)))
+    if plan.receipts:
+        head.append(f"{len(plan.receipts)} receipt(s)")
+    OUT.result(" >>> " + ", ".join(head))
+    for it in others + apps:
+        cask = next((t for t, a in plan.casks.items() if a == it.path), "")
+        line(it.path, str(it.why) + (f"; Homebrew cask {cask}: brew uninstall --zap --cask {cask}" if cask else ""))
+    for p in plan.login_items:
+        OUT.result(f"   > login item: {home_label(p, hs)}   (macOS forgets it once the item is gone)")
+    if plan.jobs:
+        running = sum(1 for _, _, _, r in plan.jobs.values() if r)
+        OUT.result(f" >>> launchd: {len(plan.jobs)} job(s)" + (f", running now: {running}" if running else ""))
+        for plist, (_, why, where, run_now) in sorted(plan.jobs.items()):
+            state = "running" if run_now else "loaded" if where else ""
+            line(plist, str(why) + (f"; {state}" if state else ""))
+    for sec in LISTED:
+        items = by.get(sec, [])
+        if not items:
+            continue
+        users: Dict[str, int] = {}
+        for it in items:
+            u = next((h.name for h in hs if inside(it.path, [h.path])), "/Library")
+            users[u] = users.get(u, 0) + 1
+        split = ", ".join(f"{u} {n}" for u, n in users.items())
+        total = sum(size_of(it.path) for it in items)
+        OUT.result(f" >>> {SECTION_TITLE[sec]}: {len(items)} ({split}), {human(total)}")
+        for it in items:
+            line(it.path, str(it.why))
+    if plan.receipts:
+        kept = {i: k for i, k in plan.receipts.items() if k}
+        if kept:
+            OUT.result(f" >>> receipts: {len(plan.receipts)} package(s), {len(kept)} with files in shared folders "
+                       f"-- those files are kept and their receipts not forgotten")
+            for rid, files in sorted(kept.items()):
+                OUT.result(f"   > {rid}: {len(files)} path(s) kept, e.g. {home_label(files[0], hs)}")
+        else:
+            OUT.result(f" >>> receipts: {len(plan.receipts)} package(s), all their files covered above")
+    for team, others2 in sorted(plan.team_kept.items()):
+        OUT.result(f" >>> team id {team} also signs {len(others2)} other app(s) -- kept what only it matched "
+                   f"({len(plan.team_kept_items)}), e.g. {home_label(others2[0], hs)}")
+        for p in plan.team_kept_items:
+            OUT.det(f"    > kept: {home_label(p, hs)}")
+    for b in sorted(plan.short_ids):
+        OUT.result(f" >>> bundle id {b}: two parts only, too short to match names -- its files only by receipt")
+    for u in plan.unreadable:
+        OUT.warn(f"{shown(u)}: not readable as {user_name(_geteuid())} -- run as root to see every user's files")
+
+
+def quoted(args: Sequence[str]) -> str:
+    return " ".join(shlex.quote(a) for a in args)
+
+
+def cmd_show(s: Settings, args: Sequence[str], verb: str = "show") -> int:
+    if not args:
+        err("020", f"{verb}: which <APP>? ({SCRIPT_NAME} --help)", 2)
+    plan = make_plan(System(s), args)
+    print_plan(plan)
+    OUT.msg(f" >>> nothing changed -- `{SCRIPT_NAME} rm {quoted(args)} go` removes it")
+    return 0
+
+
+def cmd_rm(s: Settings, args: Sequence[str]) -> int:
+    if not args or args[-1] != "go":
+        return cmd_show(s, args, "rm")
+    args = list(args[:-1])
+    if not args:
+        err("021", f"rm: which <APP>? -- `{SCRIPT_NAME} rm <APP>... go`", 2)
+    sysm = System(s)
+    plan = make_plan(sysm, args)
+    euid = _geteuid()
+    if euid != 0:
+        own = R(pwd.getpwuid(euid).pw_dir)
+        need = [p for p in plan.items if not inside(p, [own]) and _cask_of(plan, p) is None]
+        need += [j.plist for j, _, w, _ in plan.jobs.values()
+                 if any(d.startswith("system/") for d in w) and j.plist not in need]
+        forget = [i for i, kept in plan.receipts.items() if not kept]
+        if need or forget:
+            also = f" and {len(forget)} receipt(s) to forget" if forget else ""
+            err("022", f"needs root for {len(need)} of {len(plan.items)} item(s){also} -- nothing changed; "
+                       f"run: sudo {SCRIPT_NAME} rm {quoted(args)} go")
+    print_plan(plan)
+    failed: List[str] = []
+
+    for token in sorted(plan.casks):
+        phase(f"uninstalling the cask {token}")
+        rc, _, e = brew(s, "uninstall", "--zap", "--cask", token, timeout=1800)
+        OUT.msg(f" >>> brew uninstall --zap --cask {token}   [rc {rc}]")
+        if rc != 0:
+            failed.append(f"brew uninstall --zap --cask {token} [rc {rc}]: {e.strip()[-200:]}")
+
+    phase("stopping the launchd jobs")
+    for _, _, where, _ in (plan.jobs[k] for k in sorted(plan.jobs)):
+        for d in where:
+            rc, _, e = call([s.launchctl, "bootout", d], timeout=60)
+            OUT.msg(f" >>> launchctl bootout {d}   [rc {rc}]")
+            if rc != 0 and "No such process" not in e:
+                failed.append(f"launchctl bootout {d} [rc {rc}]: {e.strip()[:200]}")
+
+    phase("ending the processes")
+    roots = list(plan.items)
+    procs = [(pid, exe) for pid, exe in sysm.processes() if inside(exe, roots)]
+    if procs:
+        _end(procs)
+        OUT.msg(f" >>> ended {len(procs)} process(es): " + ", ".join(f"{e.name} [pid {pid}]" for pid, e in procs))
+
+    phase("moving the items to the Trash")
+    moved: Dict[str, int] = {}
+    size = 0
+    gone = [p for p in plan.roots() if p.exists() or p.is_symlink()]
+    for p in gone:
+        uid = owner_of(p)
+        n = size_of(p)
+        try:
+            dest = to_trash(p, uid)
+        except OSError as e:
+            failed.append(f"{shown(p)}: not moved to the Trash: {e.strerror or e}")
+            continue
+        size += n
+        moved[user_name(uid)] = moved.get(user_name(uid), 0) + 1
+        log_move(s, p, dest)
+        OUT.det(f"    > {shown(p)} -> {shown(dest)}")
+    if moved:
+        OUT.msg(f" >>> {sum(moved.values())} item(s) to Trash: "
+                + ", ".join(f"{u} {n}" for u, n in sorted(moved.items())) + f" ({human(size)})")
+
+    forget = sorted(i for i, kept in plan.receipts.items() if not kept)
+    if forget:
+        phase("forgetting the receipts")
+        done = 0
+        for rid in forget:
+            rc, _, e = call([s.pkgutil, "--forget", rid])
+            if rc == 0:
+                done += 1
+            else:
+                failed.append(f"pkgutil --forget {rid} [rc {rc}]: {e.strip()[:200]}")
+        OUT.msg(f" >>> pkgutil --forget {forget[0]}{' ...' if len(forget) > 1 else ''}   [{done} forgotten]")
+    rc = 1 if failed else 0
+    for f in failed:
+        OUT.error(f"NOT removed: {f}")
+    OUT.msg(f" >>> done: {sum(moved.values())} removed" + (f", {len(failed)} FAILED" if failed else "") + f" [rc {rc}]")
+    return rc
+
+
+def _cask_of(plan: Plan, p: Path) -> Optional[str]:
+    return next((t for t, a in plan.casks.items() if inside(p, [a])), None)
+
+
+def _end(procs: Sequence[Tuple[int, Path]]) -> None:
+    """SIGTERM, up to 5 s to go, then SIGKILL."""
+    for pid, _ in procs:
+        with contextlib.suppress(OSError):
+            _kill(pid, signal.SIGTERM)
+    deadline = time.time() + 5
+    left = [pid for pid, _ in procs]
+    while left and time.time() < deadline:
+        time.sleep(0.2)
+        alive: List[int] = []
+        for pid in left:
+            try:
+                _kill(pid, 0)
+                alive.append(pid)
+            except OSError:
+                pass
+        left = alive
+    for pid in left:
+        with contextlib.suppress(OSError):
+            _kill(pid, signal.SIGKILL)
+
+
+def trash_dir(p: Path, uid: int) -> Path:
+    """The Trash of user UID on P's volume: ~/.Trash on the system's, else
+    <volume>/.Trashes/<uid>."""
+    try:
+        home = R(pwd.getpwuid(uid).pw_dir)
+    except KeyError:
+        home = R("/var/root")
+    t = home / ".Trash"
+    try:
+        dev = os.lstat(p).st_dev
+        if os.lstat(t if t.exists() else home).st_dev == dev:
+            return t
+    except OSError:
+        return t
+    mount = p
+    while mount.parent != mount and os.lstat(mount.parent).st_dev == dev:
+        mount = mount.parent
+    return t if mount == Path("/") else mount / ".Trashes" / str(uid)
+
+
+def to_trash(p: Path, uid: int) -> Path:
+    """Move P into its owner's Trash, under a free name; never deleted."""
+    t = trash_dir(p, uid)
+    if not t.exists():
+        t.mkdir(parents=True, mode=0o700)
+        if _geteuid() == 0:
+            os.chown(t, uid, -1)
+    dest = t / p.name
+    stamp = datetime.datetime.now().strftime("%H.%M.%S")
+    k = 1
+    while dest.exists() or dest.is_symlink():     # the Finder's way: the time before the extension
+        dest = t / f"{p.stem} {stamp}{f' {k}' if k > 1 else ''}{p.suffix}"
+        k += 1
+    os.rename(p, dest)                            # never copied and deleted: another volume fails, and is listed
+    return dest
+
+
+def log_move(s: Settings, src: Path, dest: Path) -> None:
+    """One line per item moved -- what Put Back would need; a log that cannot
+    be written is said, never fatal: the item is already in the Trash."""
+    try:
+        s.log.parent.mkdir(parents=True, exist_ok=True)
+        with s.log.open("a", encoding="utf-8") as f:
+            f.write(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S}\ttrashed\t{shown(src)}\t{shown(dest)}\n")
+    except OSError as e:
+        OUT.warn(f"{s.log}: not written ({e.strerror}) -- {shown(src)} is in {shown(dest.parent)}")
+
+
+# --- intel --------------------------------------------------------------
+
+OWNER: Final = re.compile(r"\.(app|bundle|plugin|framework|prefPane|component|kext|qlgenerator|mdimporter|saver|"
+                          r"systemextension|driver|appex|xpc)/")
+BATCH: Final = 400
+
+
+@dataclass
+class Owner:
+    path: Path
+    archs: Set[str] = field(default_factory=lambda: set())
+    files: List[Path] = field(default_factory=lambda: [])
+    marks: List[str] = field(default_factory=lambda: [])
+    app_arm64: bool = False
+
+
+def owner_of_file(f: Path) -> Path:
+    """The outermost bundle around F, else F itself."""
+    m = OWNER.search(str(f))
+    return Path(str(f)[:m.end() - 1]) if m else f
+
+
+def arch_of(desc: str) -> str:
+    """'' for a file with arm64 code or no Mach-O, else its Intel (or older) archs: i386/x86_64."""
+    if "Mach-O" not in desc or "arm64" in desc:
+        return ""
+    return "/".join(a for a in ("i386", "ppc", "x86_64") if a in desc) or "other"
+
+
+def walk_executables(roots: Sequence[Path], prune: Sequence[str]) -> Tuple[List[Path], Dict[Path, List[Path]], int]:
+    """Every executable regular file under ROOTS, the symlinks (target -> links)
+    and how many entries were looked at."""
+    files: List[Path] = []
+    links: Dict[Path, List[Path]] = {}
+    seen = 0
+
+    def pruned(p: Path) -> bool:
+        s = shown(p)
+        return any(fnmatch.fnmatchcase(s, pat) for pat in prune)
+
+    stack = [r for r in roots if r.is_dir() and not pruned(r)]
+    done: Set[Path] = set()
+    while stack:
+        d = stack.pop()
+        if d in done:
+            continue
+        done.add(d)
+        try:
+            entries = list(os.scandir(d))
+        except OSError:
+            continue
+        for e in entries:
+            seen += 1
+            p = Path(e.path)
+            try:
+                if e.is_symlink():
+                    links.setdefault(Path(os.path.realpath(p)), []).append(p)
+                elif e.is_dir(follow_symlinks=False):
+                    if not pruned(p):
+                        stack.append(p)
+                elif e.is_file(follow_symlinks=False) and e.stat(follow_symlinks=False).st_mode & 0o111:
+                    files.append(p)
+            except OSError:
+                continue
+    return files, links, seen
+
+
+def file_types(s: Settings, files: Sequence[Path]) -> Dict[Path, str]:
+    """file(1)'s description of each file, in batches, bytes read as bytes. A
+    name holding a tab or a newline is typed on its own (-b): those characters
+    are file(1)'s separators."""
+    types: Dict[Path, str] = {}
+    plain = [f for f in files if "\t" not in str(f) and "\n" not in str(f)]
+    for i in range(0, len(plain), BATCH):
+        batch = plain[i:i + BATCH]
+        rc, out, e = call([s.file, "-F", "\t", *map(str, batch)], timeout=600)
+        if rc not in (0, 1):
+            err("023", f"file(1) failed [rc {rc}]: {e.strip()[:200]} -- the list would be incomplete")
+        for line in out.splitlines():
+            path, tab, desc = line.partition("\t")
+            if tab and " (for architecture " not in path:
+                types[Path(path)] = desc.strip()
+    for f in files:
+        if f not in types and f not in plain:
+            rc, out, _ = call([s.file, "-b", str(f)])
+            types[f] = out.splitlines()[0].strip() if rc == 0 and out else ""
+    return types
+
+
+def cmd_intel(s: Settings, args: Sequence[str]) -> int:
+    """What has no arm64 code, by owner, marked when it runs or starts."""
+    sysm = System(s)
+    if args:
+        roots: List[Path] = []
+        for a in args:
+            p = Path(os.path.abspath(a))
+            p = R(str(p)) if _root != Path("/") and not str(p).startswith(str(_root)) else p
+            if not p.is_dir():
+                err("024", f"intel: {a}: not a folder", 2)
+            roots.append(p)
+    else:
+        roots = [R(r) for r in s.intel_roots] + [h.path / d for h in homes() for d in s.intel_user_dirs]
+    phase("looking for executable files")
+    files, links, seen = walk_executables(roots, s.intel_prune)
+    phase(f"typing {len(files)} executable file(s) with file(1)")
+    types = file_types(s, files)
+    owners: Dict[Path, Owner] = {}
+    for f in files:
+        a = arch_of(types.get(f, ""))
+        if not a:
+            continue
+        o = owners.setdefault(owner_of_file(f), Owner(owner_of_file(f)))
+        o.archs.add(a)
+        o.files.append(f)
+    phase("checking what runs or starts")
+    procs = sysm.processes()
+    jobs = sysm.jobs()
+    logins = sysm.login_items()
+    arm_machine = platform.machine() == "arm64"
+    for o in owners.values():
+        if o.path.suffix == ".app":
+            exe = main_executable(o.path)
+            o.app_arm64 = exe not in o.files and exe in types and "Mach-O" in types[exe]
+        if any(inside(exe, [o.path]) for _, exe in procs):
+            o.marks.append("runs now")
+        if any(inside(x, [o.path]) for x in logins):
+            o.marks.append("login item")
+        started = [j.label for j in jobs if j.program is not None and inside(j.program, [o.path])]
+        if started:
+            o.marks.append(f"launchd: {started[0]}" + (f" +{len(started) - 1}" if len(started) > 1 else ""))
+        if o.path.suffix == ".kext" and arm_machine:
+            o.marks.append("never loads on Apple silicon")
+        named = [ln for t, ls in links.items() if inside(t, [o.path]) for ln in ls]
+        if named:
+            o.marks.append(f"linked from: {shown(named[0])}" + (f" +{len(named) - 1}" if len(named) > 1 else ""))
+    full = [o for o in owners.values() if not o.app_arm64]
+    OUT.result(f" >>> {len(owners)} owner(s) with no arm64 code"
+               + (f" ({len(owners) - len(full)} of them an arm64 app with Intel parts)" if len(full) < len(owners) else "")
+               + f" ({count(len(files))} executable file(s) typed of {count(seen)} looked at)")
+    for o in sorted(owners.values(), key=lambda x: str(x.path)):
+        what = "app arm64" if o.app_arm64 else "/".join(sorted(o.archs))
+        name = shown(o.path) + (f" ({len(o.files)} Intel part(s))" if o.app_arm64 else "")
+        marks = f"[{', '.join(o.marks)}]" if o.marks else ""
+        OUT.result(f"   > {what:<10} {name:<60} {marks}".rstrip())
+        if o.path.is_dir():
+            for f in o.files:
+                OUT.det(f"      > {'/'.join(sorted(o.archs)):<8} {shown(f)}")
+    if owners:
+        OUT.msg(f" >>> look only -- remove one: {SCRIPT_NAME} rm <the path> go")
+    return 0
+
+
+# --- leftovers ----------------------------------------------------------
+
+TEAM_PREFIX: Final = re.compile(r"^[A-Z0-9]{10}\.")
+ID_SUFFIX: Final = re.compile(r"\.(plist|savedState|binarycookies)$")
+FILE_EXT: Final = ("log", "gz", "zip", "txt", "json", "db", "sqlite", "bak", "tmp", "lock", "xml", "csv")
+
+
+def id_of_name(name: str) -> str:
+    """The bundle id a Library entry is named after, lower case, or '': a team
+    id prefix (TEAMID.com.example.x) and a .plist/.savedState/.binarycookies
+    suffix taken off, then three or more dot-separated labels, the first all
+    letters (a domain), none all digits, the last no file extension."""
+    n = ID_SUFFIX.sub("", TEAM_PREFIX.sub("", name))
+    n = n[6:] if n.startswith("group.") else n
+    labels = n.split(".")
+    if (len(labels) < 3 or not labels[0].isalpha() or any(not x or x.isdigit() for x in labels)
+            or labels[-1].lower() in FILE_EXT or re.fullmatch(r"[A-Za-z0-9._-]+", n) is None):
+        return ""
+    return n.lower()
+
+
+def present_ids(sysm: System) -> Set[str]:
+    """Every bundle id on the machine (apps and the bundles inside them, the
+    Library's bundles) and every launchd label: what a Library file may belong to."""
+    ids: Set[str] = set()
+    tops = app_dirs() + [R("System/Applications"), R("System/Library/CoreServices"), R("Library")]
+    for top in tops:
+        for dirpath, dirnames, _ in os.walk(top):
+            dirnames[:] = [d for d in dirnames if d not in ("Resources", "Headers", "_CodeSignature")
+                           and not d.endswith(".lproj") and not (Path(dirpath) == R("Library") and d in
+                                                                  ("Caches", "Logs", "Developer", "Application Support"))]
+            if BUNDLE_EXT.search(dirpath):
+                b = bundle_id(Path(dirpath))
+                if b:
+                    ids.add(b.lower())
+    ids |= {j.label.lower() for j in sysm.jobs()}
+    return ids
+
+
+def cmd_leftovers(s: Settings, args: Sequence[str]) -> int:
+    if args:
+        err("025", f"leftovers takes no argument ({SCRIPT_NAME} --help)", 2)
+    sysm = System(s)
+    phase("reading every bundle id on the machine")
+    ids = present_ids(sysm)
+    hs = homes()
+    found: List[Tuple[Path, str]] = []
+    phase("looking at the Library folders")
+    for lib in [R("Library")] + [h.path / "Library" for h in hs]:
+        if not readable(lib):
+            OUT.warn(f"{shown(lib)}: not readable as {user_name(_geteuid())} -- run as root to see every user's files")
+            continue
+        for d in LIBRARY_DIRS:
+            for e in listdir(lib / d):
+                bid = id_of_name(e.name)
+                if not bid or bid.startswith("com.apple."):
+                    continue
+                if id_match(bid, ids) or any(i.startswith(bid + ".") for i in ids):
+                    continue
+                found.append((e, bid))
+    total = sum(size_of(p) for p, _ in found)
+    OUT.result(f" >>> {len(found)} leftover(s) of {len({b for _, b in found})} bundle id(s) no installed app or job has"
+               + (f", {human(total)}" if found else ""))
+    for p, bid in sorted(found):
+        OUT.result(f"   > {home_label(p, hs):<70} [{bid}]")
+    if found:
+        OUT.msg(f" >>> look only -- remove one: {SCRIPT_NAME} rm <the path> go")
+    return 0
+
+
+# --- 5. cli, version, completion, main ---------------------------------------
+
+def build_id() -> str:
+    return hashlib.sha256(Path(os.path.realpath(__file__)).read_bytes()).hexdigest()[:12]
+
+
+def version_line() -> str:
+    """The exact build: the version; git's describe where this file is tracked
+    in its OWN repository (else the stamped commit); the hash of the bytes."""
+    me = Path(os.path.realpath(__file__))
+    desc = SCRIPT_COMMIT
+
+    def git(*a: str) -> str:
+        r = subprocess.run(["git", "-C", str(me.parent), *a], capture_output=True, check=False, text=True, timeout=10)
+        return r.stdout.strip() if r.returncode == 0 else ""
+
+    try:
+        if git("remote", "get-url", "origin").endswith((REPOSITORY, REPOSITORY + ".git")) \
+                and git("ls-files", me.name) == me.name:
+            desc = git("describe", "--tags", "--long", "--always", "--dirty") or desc
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return f"{SCRIPT_NAME} {SCRIPT_VERSION} ({desc}, build {build_id()})"
+
+
+HELP: Final = f"""\
+usage: {SCRIPT_NAME} [-Q] [-V] [-D [PATH]] [--config <FILE>] [--create-config [FILE]]
+                     [--run-tests [FILTER]] [--version] [-h] <VERB> ...
+
+Uninstall an app with everything it put on this machine.
+
+verbs:
+  show <APP>...          what an uninstall of <APP> removes, and why each item is
+                         there -- changes nothing (also what a bare <APP> does)
+  rm <APP>... go         remove it: Homebrew casks by brew, launchd jobs booted out,
+                         processes ended, then everything moved to its owner's
+                         Trash; receipts forgotten. Without go: what show prints
+  intel [<DIR>...]       what has no Apple-silicon (arm64) code -- apps, bundles,
+                         loose programs, kexts -- by owner, marked when it runs now
+                         or starts; each line is an <APP> for `rm` (look only;
+                         <DIR> narrows it, default: INTEL_ROOTS and every user's own)
+  leftovers              files in the Library folders whose app is gone (look only)
+
+<APP> is an .app path, a bundle id (com.example.app), an installer package id
+(com.example.pkg.app), a folder of apps (/Applications/Example Suite: every app
+in it), or any other path `intel` lists -- a loose program, a kext, a folder:
+then it, its receipt and its launchd jobs.
+
+What it looks at, for an app's bundle id, its team id and its receipts:
+  the app itself                   and any other copy with the same bundle id
+  launchd jobs                     /Library/Launch{{Agents,Daemons}}, every ~/Library/LaunchAgents
+  helpers                          /Library/PrivilegedHelperTools; login items are named
+                                   (macOS forgets them once the item is gone)
+  extensions                       Extensions (kexts), Audio plug-ins, QuickLook, Spotlight,
+                                   PreferencePanes, Printers, Image Capture, Input Methods,
+                                   Internet Plug-Ins, Screen Savers, Services
+  Library files, every user        Application Support, Caches, Preferences, Containers,
+                                   Group Containers, Saved Application State, HTTPStorages,
+                                   WebKit, Logs, Cookies, Application Scripts
+  installer receipts               pkgutil: every file the package installed, then --forget
+Each item says which of these matched it: the bundle id, the team id, a receipt,
+or a launchd job's program inside the item. A name alone matches nothing (too many
+apps share words like "Scan"). A team id that also signs an app not being removed
+matches nothing: that app keeps its files. A receipt's file in a folder that also
+holds files of no receipt being removed is kept, and its receipt not forgotten.
+Never removed: macOS's own (/System, com.apple.*), a folder things are installed
+into (/Applications, /Library/Preferences, a home, ...) or anything holding one.
+
+A Homebrew cask's app is removed by `brew uninstall --zap --cask <cask>`: the
+cask's zap list is the vendor-specific knowledge, kept by Homebrew (as root, brew
+runs as its owner).
+
+root: `rm ... go` on anything outside your own home. Without root it prints the
+exact command and stops, changing nothing. `show` without root cannot see other
+users' Library folders, and says so.
+
+The Trash: each item goes to its owner's (root's for root's files: /var/root/.Trash),
+never deleted; an item on another volume than its owner's Trash goes to that
+volume's .Trashes. LOG keeps one line per item moved: from where, to where.
+
+options:
+  -Q, --quiet            only results and errors: no narration
+  -V, --verbose          more: each file moved, each Intel file of an owner
+  -D, --debug [PATH]     -V and diagnostics (~~~), each command it calls; a PATH
+                         ending in .log gets them appended too
+  --config <FILE>        this config, nothing else
+  --create-config [FILE] the default config, to stdout or into a new FILE
+  --run-tests [FILTER]   the built-in tests (TAP), those whose name holds FILTER
+  --version              the exact build: version, git describe or commit, build id
+  -h, --help             this
+
+config: $MY_APPCLEANER_CONFIG, --config, then the first of: the site's config
+folder (site.conf's CONFIG_SEARCH_DIR: {SCRIPT_NAME}.conf, then {SCRIPT_NAME};
+there a {SCRIPT_NAME}.conf.GLOBAL is read first), ~/.{SCRIPT_NAME}.conf,
+/etc/{SCRIPT_NAME}.conf, /usr/local/etc/{SCRIPT_NAME}.conf. The commands it calls
+are config keys (FILE, PKGUTIL, LAUNCHCTL, CODESIGN, PS, SFLTOOL, BREW).
+
+exit: 0 done (or shown), 1 something could not be removed (listed) or an error,
+      2 usage, 70 internal error (trace in a file, named), 130 Ctrl-C.
+"""
+
+VERBS: Final = ("show", "rm", "intel", "leftovers", "help")
+ADMIN: Final = ("--run-tests", "--version", "--create-config")
+
+
+@dataclass
+class Cli:
+    verb: Optional[str] = None
+    args: List[str] = field(default_factory=lambda: [])
+    quiet: Optional[bool] = None
+    vrb: Optional[bool] = None
+    dbg: Optional[bool] = None
+    dbg_file: Optional[str] = None
+    config: Optional[str] = None
+
+
+def parse_cli(argv: Sequence[str]) -> Cli:
+    """The options anywhere; the first other word is the verb, or an <APP> for show."""
+    c = Cli()
+    args = list(argv)
+    i = 0
+    while i < len(args):
+        a = args[i]
+        key, eq, val = a.partition("=")
+        i += 1
+        if a in ("-Q", "--quiet"):
+            c.quiet = True
+        elif a in ("-V", "--verbose"):
+            c.vrb = True
+        elif key in ("-D", "--debug"):
+            c.dbg = True
+            if eq:
+                c.dbg_file = val
+            elif i < len(args) and args[i].endswith(".log") and not args[i].startswith("-"):
+                c.dbg_file = args[i]
+                i += 1
+        elif key == "--config":
+            v = val if eq else (args[i] if i < len(args) else "")
+            if not eq:
+                i += 1
+            if not v:
+                err("026", "--config needs a <FILE>", 2)
+            c.config = v
+        elif a in ("-h", "--help"):
+            c.verb = "help"
+        elif key in ADMIN and c.verb is None:
+            c.verb = key
+            if eq:
+                c.args.append(val)
+            elif key != "--version" and i < len(args) and not args[i].startswith("-"):
+                c.args.append(args[i])
+                i += 1
+        elif a.startswith("-") and a != "-":
+            verb = a.lstrip("-")
+            hint = f" -- you mean `{SCRIPT_NAME} {verb}`" if verb in VERBS else f" ({SCRIPT_NAME} --help)"
+            err("027", f"no such option '{a}'{hint}", 2)
+        elif c.verb is None:
+            if a in VERBS:
+                c.verb = a
+            else:
+                c.verb = "show"
+                c.args.append(a)
+        else:
+            c.args.append(a)
+    if "go" in c.args and c.args[-1] != "go":
+        err("028", f"go is the final word -- you mean: {SCRIPT_NAME} {c.verb} "
+                   f"{quoted([x for x in c.args if x != 'go'])} go", 2)
+    if "go" in c.args and c.verb != "rm":
+        err("029", f"{c.verb} only looks, it takes no go -- you mean: {SCRIPT_NAME} rm "
+                   f"{quoted(c.args[:-1])} go", 2)
+    return c
+
+
+def create_config(target: Optional[str]) -> int:
+    if target is None:
+        sys.stdout.write(DEFAULT_CONFIG)
+        return 0
+    p = Path(target)
+    try:
+        with p.open("x", encoding="utf-8") as f:
+            f.write(DEFAULT_CONFIG)
+    except FileExistsError:
+        err("030", f"{p} exists -- never written over (compare it with `{SCRIPT_NAME} --create-config`)")
+    OUT.msg(f" >>> wrote the default config to {p}")
+    return 0
+
+
+def run(argv: Sequence[str]) -> int:
+    c = parse_cli(argv)
+    if c.verb == "--run-tests":
+        return run_tests(c.args[0] if c.args else "")
+    if c.verb == "--version":
+        OUT.result(version_line())
+        return 0
+    if c.verb == "--create-config":
+        return create_config(c.args[0] if c.args else None)
+    if c.verb in (None, "help"):
+        OUT.result(HELP)
+        return 0 if c.verb == "help" else 2
+    s = load_settings(c.config)
+    OUT.dbg_on = c.dbg if c.dbg is not None else s.dbg
+    OUT.dbg_file = Path(c.dbg_file) if c.dbg_file else None
+    OUT.vrb = OUT.dbg_on or (c.vrb if c.vrb is not None else s.vrb)
+    OUT.quiet = (c.quiet if c.quiet is not None else s.quiet) and not OUT.vrb   # -V beats -Q
+    install_completion()
+    return _verbs[c.verb](s, c.args)
+
+
+_verbs: Dict[str, Callable[[Settings, Sequence[str]], int]] = {
+    "show": cmd_show, "rm": cmd_rm, "intel": cmd_intel, "leftovers": cmd_leftovers}
+
+
+COMPLETION: Final = f"""#compdef {SCRIPT_NAME}
+# written by {SCRIPT_NAME} itself, on every run where it changed
+_{SCRIPT_NAME.replace('-', '_')}() {{
+  local -a verbs
+  verbs=(show:'what an uninstall removes, and why' rm:'remove it (with go)'
+         intel:'what has no arm64 code' leftovers:'Library files whose app is gone')
+  if (( CURRENT == 2 )); then
+    _describe verb verbs
+    _arguments '-Q[quiet]' '-V[verbose]' '-D[debug]' '--config[config file]:file:_files' \\
+      '--create-config[the default config]' '--run-tests[the built-in tests]' '--version[the exact build]' \\
+      '*:app:_files'
+    return
+  fi
+  case $words[2] in
+    show) _files ;;
+    rm) _alternative 'go:go:(go)' 'app:app:_files' ;;
+    intel) _files -/ ;;
+  esac
+}}
+_{SCRIPT_NAME.replace('-', '_')} "$@"
+"""
+
+
+_completion_on = True     # off in --run-tests: a test never writes into $HOME
+
+
+def install_completion() -> None:
+    """The zsh completion, written when it changed -- best effort, never fails a run."""
+    if not _completion_on:
+        return
+    try:
+        folder = Path.home() / ".zsh" / "completions"
+        target = folder / f"_{SCRIPT_NAME}"
+        if target.is_file() and target.read_text(encoding="utf-8") == COMPLETION:
+            return
+        folder.mkdir(parents=True, exist_ok=True)
+        tmp = folder / f".{target.name}.{os.getpid()}"
+        tmp.write_text(COMPLETION, encoding="utf-8")
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, target)
+        for dump in Path.home().glob(".zcompdump*"):
+            dump.unlink()
+        zshrc = Path.home() / ".zshrc"
+        if zshrc.is_file() and ".zsh/completions" not in zshrc.read_text(encoding="utf-8"):
+            with zshrc.open("a", encoding="utf-8") as f:
+                f.write("\nfpath=(~/.zsh/completions $fpath); autoload -Uz compinit && compinit\n")
+        OUT.msg(f" >>> zsh completion written: {target}   (it changed: new verbs or options)")
+    except OSError as e:
+        OUT.dbg(f"zsh completion not written: {e}")
+
+
+def trace_file() -> Path:
+    """Where a bug's trace goes: the user's log folder (site.conf), else the temp folder."""
+    name = f"{SCRIPT_NAME}.{datetime.datetime.now():%Y-%m-%d_%H%M%S}.{os.getpid()}.trace"
+    try:
+        d = Path(read_site().log_base_dir) / pwd.getpwuid(_geteuid()).pw_name
+        if os.access(d, os.W_OK):
+            return d / name
+    except (CleanerError, OSError, KeyError):
+        pass
+    return Path(tempfile.gettempdir()) / name
+
+
+def main(argv: Sequence[str]) -> int:
+    """Every way a run ends: 0; 1 or 2 with ONE error line; 130 on Ctrl-C; 70
+    and a trace file on a bug -- never a traceback on the screen."""
+    try:
+        return run(argv)
+    except CleanerError as e:
+        OUT.error(err_line(e.code, e.rc, e.text))
+        return e.rc
+    except KeyboardInterrupt:
+        OUT.error(f"{SCRIPT_NAME}: interrupted (Ctrl-C) while {_phase} -- what was moved to the Trash before "
+                  f"stays there (LOG names it); run it again to go on")
+        return 130
+    except OSError as e:
+        OUT.error(err_line("031", 1, f"while {_phase}: {e.strerror or e}" + (f": {e.filename}" if e.filename else "")))
+        return 1
+    except Exception as e:   # a bug: one line here, the trace in a file
+        where = trace_file()
+        try:
+            where.write_text(f"{version_line()}\nargv: {list(argv)}\n\n{traceback.format_exc()}", encoding="utf-8")
+        except OSError:
+            where = Path("(not written)")
+        OUT.error(err_line("032", 70, f"unexpected {type(e).__name__} while {_phase} -- the trace: {where}"))
+        return 70
+
+
+# --- --run-tests -----------------------------------------------------------
+# TAP: the plan first, then "ok K - name" / "not ok K - name" as each ends.
+# Each test builds its own system tree in a temp folder (_root points there);
+# pkgutil, launchctl, codesign, ps, sfltool, brew and file are one stub script
+# answering from the test's stub.json and logging each call -- nothing real is
+# asked or changed, and the tests run as any user.
+
+STUB: Final = r'''#!/usr/bin/env python3
+import json, os, sys, time
+here = os.path.dirname(os.path.abspath(__file__))
+cmd = os.path.basename(sys.argv[0])
+args = sys.argv[1:]
+with open(os.path.join(here, "calls.log"), "a") as f:
+    nau = " HOMEBREW_NO_AUTO_UPDATE=1" if os.environ.get("HOMEBREW_NO_AUTO_UPDATE") == "1" else ""
+    f.write(cmd + nau + " " + " ".join(args) + "\n")
+table = json.load(open(os.path.join(here, "stub.json")))
+if cmd == "file":
+    if table.get("file-sleep"):
+        time.sleep(30)
+    files = args[2:] if args[:1] == ["-F"] else args[1:]
+    for p in files:
+        try:
+            first = open(p, "rb").read(200).split(b"\n")[0]
+        except OSError:
+            first = b""
+        if first.startswith(b"MACHO "):
+            archs = first[6:].decode().split(",")
+            desc = b"Mach-O 64-bit executable " + archs[0].encode() if len(archs) == 1 else \
+                ("Mach-O universal binary with %d architectures: " % len(archs)).encode() + \
+                b" ".join(b"[" + a.encode() + b":Mach-O 64-bit executable " + a.encode() + b"]" for a in archs)
+            desc += b" \xe9\xff"                       # bytes that are no UTF-8
+        else:
+            desc = b"POSIX shell script text executable, ASCII text"
+        if args[:1] == ["-b"]:
+            sys.stdout.buffer.write(desc + b"\n")
+            continue
+        sys.stdout.buffer.write(p.encode() + b"\t" + b" " * 8 + desc + b"\n")
+        if first.startswith(b"MACHO ") and len(archs) > 1:
+            for a in archs:
+                sys.stdout.buffer.write(p.encode() + (" (for architecture %s):\t" % a).encode() + b"Mach-O " + a.encode() + b"\n")
+    sys.exit(0)
+answer = table.get(cmd, {}).get(" ".join(args))
+if answer is None:
+    sys.exit(1)
+out, rc = answer if isinstance(answer, list) else (answer, 0)
+stream = sys.stderr if cmd == "codesign" else sys.stdout
+stream.write(out)
+sys.exit(rc)
+'''
+
+
+class T:
+    """One test: its system tree, the stub, the config, what it found wrong."""
+
+    def __init__(self, folder: Path) -> None:
+        self.dir = folder
+        self.root = folder / "sys"
+        self.bad: List[str] = []
+        self.me = pwd.getpwuid(os.getuid()).pw_name
+        self.uid = os.getuid()
+        self.home = self.root / "Users" / self.me
+        for d in ("Applications", "Library/LaunchDaemons", "Library/LaunchAgents", "Library/Preferences",
+                  "Library/Application Support", "Library/PrivilegedHelperTools", "Library/Extensions", "usr/local/bin",
+                  f"Users/{self.me}/Library/Preferences", f"Users/{self.me}/Library/Caches",
+                  f"Users/{self.me}/Library/Group Containers", f"Users/{self.me}/Library/LaunchAgents",
+                  "Users/other/Library/Preferences", "Users/Shared", "var/root"):
+            (self.root / d).mkdir(parents=True, exist_ok=True)
+        self.bin = folder / "bin"
+        self.bin.mkdir()
+        stub = self.bin / "stub"
+        stub.write_text(f"#!{sys.executable}\n" + STUB.split("\n", 1)[1], encoding="utf-8")
+        stub.chmod(0o755)
+        for c in ("pkgutil", "launchctl", "codesign", "ps", "sfltool", "brew", "file"):
+            (self.bin / c).symlink_to(stub)
+        self.table: Dict[str, object] = {"pkgutil": {"--pkgs": ""}}
+        self.save()
+
+    def check(self, ok: bool, what: str) -> None:
+        if not ok:
+            self.bad.append(what)
+
+    def answer(self, cmd: str, args: str, out: str, rc: int = 0) -> None:
+        cast(Dict[str, object], self.table.setdefault(cmd, {}))[args] = [out, rc]
+        self.save()
+
+    def save(self) -> None:
+        (self.bin / "stub.json").write_text(json.dumps(self.table), encoding="utf-8")
+
+    def calls(self) -> str:
+        p = self.bin / "calls.log"
+        return p.read_text(encoding="utf-8") if p.exists() else ""
+
+    def path(self, rel: str) -> Path:
+        return self.root / rel
+
+    def write(self, rel: str, text: str = "x", mode: int = 0o644) -> Path:
+        p = self.root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+        p.chmod(mode)
+        return p
+
+    def app(self, rel: str, bid: str, team: str = "", archs: str = "arm64") -> Path:
+        a = self.root / rel
+        exe = a / "Contents" / "MacOS" / a.stem
+        exe.parent.mkdir(parents=True)
+        exe.write_text(f"MACHO {archs}\n", encoding="utf-8")
+        exe.chmod(0o755)
+        with (a / "Contents" / "Info.plist").open("wb") as f:
+            plistlib.dump({"CFBundleIdentifier": bid, "CFBundleExecutable": a.stem}, f)
+        if team:
+            self.answer("codesign", f"-dv {a}", f"Identifier={bid}\nTeamIdentifier={team}\n")
+        return a
+
+    def plist(self, rel: str, data: Dict[str, object]) -> Path:
+        p = self.root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("wb") as f:
+            plistlib.dump(data, f)
+        return p
+
+    def receipt(self, pkg: str, location: str, files: Sequence[str]) -> None:
+        t = cast(Dict[str, object], self.table["pkgutil"])
+        t["--pkgs"] = str(t["--pkgs"]) + pkg + "\n"
+        info = plistlib.dumps({"pkgid": pkg, "volume": "/", "install-location": location}).decode()
+        self.answer("pkgutil", f"--pkg-info-plist {pkg}", info)
+        self.answer("pkgutil", f"--pkg-info {pkg}", f"package-id: {pkg}\n")
+        self.answer("pkgutil", f"--files {pkg}", "".join(f + "\n" for f in files))
+        self.answer("pkgutil", f"--forget {pkg}", f"Forgot package '{pkg}' on '/'.\n")
+
+    def config(self, extra: str = "") -> Path:
+        p = self.dir / "conf"
+        b = self.bin
+        p.write_text(f'FILE="{b}/file"\nPKGUTIL="{b}/pkgutil"\nLAUNCHCTL="{b}/launchctl"\nCODESIGN="{b}/codesign"\n'
+                     f'PS="{b}/ps"\nSFLTOOL="{b}/sfltool"\nBREW="{b}/brew"\nLOG="{self.dir}/log/moves.log"\n'
+                     f'INTEL_ROOTS="/Applications|/Library|/usr/local"\n'
+                     f'INTEL_PRUNE="/Library/Caches"\n' + extra, encoding="utf-8")
+        return p
+
+    def run(self, argv: Sequence[str]) -> Tuple[int, str, str]:
+        """The tool in-process: rc, stdout, stderr."""
+        out, errs = io.StringIO(), io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(errs):
+                rc = main(["--config", str(self.config()), *argv])
+        finally:
+            OUT.__init__()
+        return rc, out.getvalue(), errs.getvalue()
+
+    def trashed(self, name: str, user: str = "") -> bool:
+        return (self.root / "Users" / (user or self.me) / ".Trash" / name).exists()
+
+
+def epson(t: T) -> Path:
+    """An app suite: two apps, an agent, prefs for two users, a receipt with a vendor folder, a kext."""
+    a = t.app("Applications/Example Software/Event Manager.app", "com.example.Event-Manager", "TEAM123456")
+    t.app("Applications/Example Software/Example Manuals.app", "com.example.Manuals", "TEAM123456")
+    t.write(f"Users/{t.me}/Library/Preferences/com.example.Event-Manager.plist")
+    t.write("Users/other/Library/Preferences/com.example.Event-Manager.plist")
+    t.write(f"Users/{t.me}/Library/Caches/com.example.Manuals/cache.db")
+    t.write(f"Users/{t.me}/Library/Group Containers/TEAM123456.shared/x")
+    t.write(f"Users/{t.me}/Library/Preferences/Scan Settings.plist")          # a name alone: never matched
+    t.write(f"Users/{t.me}/Library/Preferences/com.example.Event-ManagerX.plist")   # no dot after the id
+    t.plist("Library/LaunchAgents/com.example.agent.plist",
+            {"Label": "com.example.agent", "ProgramArguments": [shown(a / "Contents/MacOS/Event Manager"), "-x"]})
+    t.write("Library/Application Support/EXAMPLE/scanner.bin")
+    t.write("Library/Extensions/ExampleRAID.kext/Contents/Info.plist", "x")
+    t.receipt("com.example.pkg.scanner", "/", ["Library", "Library/Application Support/EXAMPLE",
+                                                   "Library/Application Support/EXAMPLE/scanner.bin",
+                                                   "Library/Extensions/ExampleRAID.kext",
+                                                   "Library/Extensions/ExampleRAID.kext/Contents",
+                                                   "Library/Extensions/ExampleRAID.kext/Contents/Info.plist",
+                                                   "Applications/Example Software/Event Manager.app"])
+    t.answer("launchctl", f"print gui/{t.uid}/com.example.agent", "\tstate = running\n\tpid = 4242\n")
+    t.answer("launchctl", f"bootout gui/{t.uid}/com.example.agent", "")
+    t.answer("ps", "-axo pid=,comm=", f"  1 /sbin/launchd\n4242 {shown(a)}/Contents/MacOS/Event Manager\n")
+    return t.path("Applications/Example Software")
+
+
+def t_show_finds_everything(t: T) -> None:
+    folder = epson(t)
+    rc, out, e = t.run(["show", str(folder)])
+    t.check(rc == 0, f"rc {rc}: {e}")
+    for want in ("2 app(s), 1 item(s), team id TEAM123456, 1 receipt(s)",
+                 "Event Manager.app", "[in the folder]",
+                 "com.example.agent.plist", "[program in item; running]",
+                 f"~{t.me}/Library/Preferences/com.example.Event-Manager.plist", "~other/Library/Preferences",
+                 f"~{t.me}/Library/Caches/com.example.Manuals", "TEAM123456.shared", "[team id TEAM123456]",
+                 "/Library/Application Support/EXAMPLE", "/Library/Extensions/ExampleRAID.kext",
+                 "[receipt com.example.pkg.scanner]", "all their files covered above"):
+        t.check(want in out, f"show prints {want!r}:\n{out}")
+    for never in ("Scan Settings", "Event-ManagerX"):
+        t.check(never not in out, f"{never} is not matched (a name alone, no dot after the id)")
+    t.check((folder / "Event Manager.app").exists(), "show changes nothing")
+    t.check("nothing changed" in e and "rm" in e, f"show says how to remove: {e}")
+
+
+def t_bare_app_is_show(t: T) -> None:
+    folder = epson(t)
+    rc, out, _ = t.run([str(folder)])
+    t.check(rc == 0 and "Event Manager.app" in out, f"a bare <APP> shows it: rc {rc}")
+
+
+def t_rm_without_go_changes_nothing(t: T) -> None:
+    folder = epson(t)
+    rc, out, e = t.run(["rm", str(folder)])
+    t.check(rc == 0 and "Event Manager.app" in out, f"rm without go shows: rc {rc}")
+    t.check(folder.exists() and "bootout" not in t.calls() and "--forget" not in t.calls(), "and changes nothing")
+    t.check(f"rm {shlex.quote(str(folder))} go" in e, f"it names the go: {e}")
+
+
+def t_rm_go_moves_to_trash(t: T) -> None:
+    global _geteuid, _kill
+    folder = epson(t)
+    killed: List[Tuple[int, int]] = []
+
+    def kill(pid: int, sig: int) -> None:
+        killed.append((pid, sig))
+        if sig == 0:
+            raise ProcessLookupError()
+
+    _geteuid, _kill = (lambda: 0), kill
+    rc, _, e = t.run(["rm", str(folder), "go"])
+    t.check(rc == 0, f"rc {rc}: {e}")
+    calls = t.calls()
+    t.check(f"launchctl bootout gui/{t.uid}/com.example.agent" in calls, f"the agent is booted out: {calls}")
+    t.check((4242, signal.SIGTERM) in killed, f"the running app is ended: {killed}")
+    t.check("pkgutil --forget com.example.pkg.scanner" in calls, "the receipt is forgotten")
+    for gone in ("Applications/Example Software", "Library/LaunchAgents/com.example.agent.plist",
+                 "Library/Application Support/EXAMPLE", "Library/Extensions/ExampleRAID.kext",
+                 f"Users/{t.me}/Library/Preferences/com.example.Event-Manager.plist",
+                 "Users/other/Library/Preferences/com.example.Event-Manager.plist"):
+        t.check(not t.path(gone).exists(), f"{gone} is gone from its place")
+    t.check(t.trashed("Example Software") and t.trashed("com.example.Event-Manager.plist")
+            and t.trashed("ExampleRAID.kext"), "everything is in the owner's Trash")
+    t.check(t.path(f"Users/{t.me}/Library/Preferences/Scan Settings.plist").exists(), "an unmatched file stays")
+    log = (t.dir / "log" / "moves.log").read_text(encoding="utf-8")
+    t.check("\ttrashed\t/Applications/Example Software\t" in log, f"LOG names each move: {log}")
+    t.check(" >>> done: " in e and " removed [rc 0]" in e, f"the summary: {e}")
+
+
+def t_needs_root(t: T) -> None:
+    global _geteuid
+    folder = epson(t)
+    nobody = pwd.getpwnam("nobody").pw_uid
+    _geteuid = lambda: nobody                                 # not root, and not the owner of the test's files
+    rc, _, e = t.run(["rm", str(folder), "go"])
+    t.check(rc == 1 and "needs root for" in e and f"run: sudo {SCRIPT_NAME} rm" in e, f"rc {rc}: {e}")
+    t.check(folder.exists() and "bootout" not in t.calls(), "nothing changed")
+
+
+def t_own_library_without_root(t: T) -> None:
+    global _geteuid
+    p = t.write(f"Users/{t.me}/Library/Preferences/org.example.tool.plist")
+    _geteuid = os.getuid
+    rc, _, e = t.run(["rm", str(p), "go"])
+    t.check(rc == 0 and not p.exists() and t.trashed(p.name), f"a file in one's own home needs no root: rc {rc}: {e}")
+
+
+def t_team_shared_is_kept(t: T) -> None:
+    a = t.app("Applications/One.app", "com.vendor.one", "TEAMSHARED")
+    t.app("Applications/Two.app", "com.vendor.two", "TEAMSHARED")
+    g = t.write(f"Users/{t.me}/Library/Group Containers/TEAMSHARED.office/x")
+    rc, out, e = t.run(["show", str(a)])
+    t.check(rc == 0, f"rc {rc}: {e}")
+    t.check("TEAMSHARED.office" not in out.split(" >>> team id")[0], f"a team id another app shares matches nothing:\n{out}")
+    t.check("team id TEAMSHARED also signs 1 other app(s)" in out, f"and says so:\n{out}")
+    t.check(g.exists(), "nothing changed")
+
+
+def t_shared_folder_kept(t: T) -> None:
+    a = t.app("Applications/Tool.app", "com.vendor.tool")
+    t.write("Library/Application Support/Vendor/tool.dat")
+    t.write("Library/Application Support/Vendor/other-product.dat")      # no receipt names it
+    t.receipt("com.vendor.pkg.tool", "/", ["Applications/Tool.app", "Library/Application Support/Vendor",
+                                             "Library/Application Support/Vendor/tool.dat"])
+    rc, out, e = t.run(["show", str(a)])
+    t.check(rc == 0, f"rc {rc}: {e}")
+    t.check("/Library/Application Support/Vendor " not in out, f"a shared folder is not removed:\n{out}")
+    t.check("com.vendor.pkg.tool: 2 path(s) kept" in out, f"its folder and file are kept, the receipt named:\n{out}")
+    global _geteuid
+    _geteuid = lambda: 0
+    rc, _, e = t.run(["rm", str(a), "go"])
+    t.check(rc == 0 and "--forget com.vendor.pkg.tool" not in t.calls(), f"and its receipt not forgotten: {e}")
+    t.check(t.path("Library/Application Support/Vendor/tool.dat").exists(), "the kept file stays")
+
+
+def t_never_removed(t: T) -> None:
+    t.app("Applications/Safari.app", "com.apple.Safari")
+    for args, want in ((["rm", str(t.path("Applications")), "go"], "never removed"),
+                       (["show", str(t.path("Library/Preferences"))], "never removed"),
+                       (["show", str(t.path(f"Users/{t.me}"))], "never removed"),
+                       (["show", "com.apple.Safari"], "part of macOS"),
+                       (["show", str(t.path("Applications/Safari.app"))], "part of macOS")):
+        t.write("System/Library/x")
+        rc, _, e = t.run(args)
+        t.check(rc == 1 and want in e, f"{args[1]}: rc {rc}: {e}")
+    rc, _, e = t.run(["show", str(t.path("System/Library/x"))])
+    t.check(rc == 1 and "part of macOS" in e, f"/System: rc {rc}: {e}")
+
+
+def t_bundle_and_package_ids(t: T) -> None:
+    t.app("Applications/Tool.app", "com.vendor.Tool")
+    rc, out, e = t.run(["show", "com.vendor.tool"])
+    t.check(rc == 0 and "Tool.app" in out and "[given (com.vendor.tool)]" in out, f"a bundle id: rc {rc}: {e}\n{out}")
+    t.write("usr/local/bin/vtool", "x", 0o755)
+    t.receipt("com.vendor.pkg.cli", "/usr/local", ["bin", "bin/vtool"])
+    rc, out, e = t.run(["show", "com.vendor.pkg.cli"])
+    t.check(rc == 0 and "/usr/local/bin/vtool" in out and "[receipt com.vendor.pkg.cli]" in out,
+            f"a package id: rc {rc}: {e}\n{out}")
+    rc, _, e = t.run(["show", "com.nobody.nothing"])
+    t.check(rc == 1 and "no app with that bundle id" in e, f"an unknown id: {e}")
+
+
+def t_loose_program_and_its_job(t: T) -> None:
+    p = t.write("usr/local/bin/example-tool", "MACHO x86_64\n", 0o755)
+    t.plist("Library/LaunchDaemons/org.example.tool.plist", {"Label": "org.example.tool", "Program": "/usr/local/bin/example-tool"})
+    t.answer("launchctl", "print system/org.example.tool", "\tstate = waiting\n")
+    t.answer("launchctl", "bootout system/org.example.tool", "")
+    global _geteuid
+    _geteuid = lambda: 0
+    rc, out, e = t.run(["rm", str(p), "go"])
+    t.check(rc == 0 and "org.example.tool.plist" in out and "[program in item; loaded]" in out, f"rc {rc}: {e}\n{out}")
+    t.check("launchctl bootout system/org.example.tool" in t.calls(), "its daemon is booted out")
+    t.check(not p.exists() and not t.path("Library/LaunchDaemons/org.example.tool.plist").exists(), "both are gone")
+
+
+def t_cask_goes_through_brew(t: T) -> None:
+    a = t.app("Applications/Caskd.app", "org.example.caskd")
+    t.answer("brew", "info --json=v2 --installed --cask",
+             json.dumps({"casks": [{"token": "caskd", "artifacts": [{"app": ["Caskd.app"], "target": "/Applications/Caskd.app"}]}]}))
+    t.answer("brew", "uninstall --zap --cask caskd", "")
+    rc, out, _ = t.run(["show", str(a)])
+    t.check("brew uninstall --zap --cask caskd" in out, f"show names the cask's way:\n{out}")
+    global _geteuid
+    _geteuid = os.getuid
+    rc, _, e = t.run(["rm", str(a), "go"])
+    t.check(rc == 0 and "uninstall --zap --cask caskd" in t.calls(), f"rm calls brew: rc {rc}: {e}")
+    brews = [ln for ln in t.calls().splitlines() if ln.startswith("brew")]
+    t.check(len(brews) == 3 and all(ln.startswith("brew HOMEBREW_NO_AUTO_UPDATE=1 ") for ln in brews),
+            f"every brew call without its auto-update: {brews}")
+
+
+def t_intel_lists_owners(t: T) -> None:
+    t.app("Applications/Old Scan.app", "com.example.oldscan", archs="x86_64")
+    big = t.app("Applications/Big Suite.app", "com.example.big", archs="arm64,x86_64")
+    t.write("Applications/Big Suite.app/Contents/Helpers/updater", "MACHO x86_64\n", 0o755)
+    t.write("Library/Extensions/OldRAID.kext/Contents/MacOS/OldRAID", "MACHO x86_64\n", 0o755)
+    tool = t.write("usr/local/bin/old-tool", "MACHO i386,x86_64\n", 0o755)
+    t.write("usr/local/bin/new-tool", "MACHO arm64,x86_64\n", 0o755)
+    t.write("usr/local/bin/script", "#!/bin/sh\n", 0o755)
+    t.write("usr/local/bin/tab\tname", "MACHO x86_64\n", 0o755)
+    (t.path("usr/local/bin/old-link")).symlink_to(tool)
+    t.answer("ps", "-axo pid=,comm=", "77 /Applications/Old Scan.app/Contents/MacOS/Old Scan\n")
+    rc, out, e = t.run(["intel"])
+    t.check(rc == 0, f"rc {rc}: {e}")
+    for want in ("Applications/Old Scan.app", "[runs now]", "app arm64", "Big Suite.app (1 Intel part(s))",
+                 "OldRAID.kext", "/usr/local/bin/old-tool", "i386/x86_64", "linked from: /usr/local/bin/old-link",
+                 "tab\tname"):
+        t.check(want in out, f"intel prints {want!r}:\n{out}")
+    for never in ("new-tool", "script"):
+        t.check(never not in out, f"{never} has arm64 or is no Mach-O:\n{out}")
+    t.check(" >>> 5 owner(s) with no arm64 code (1 of them an arm64 app with Intel parts)" in out, f"the count:\n{out}")
+    t.check(str(big) not in out or "app arm64" in out, "an arm64 app with Intel parts is marked so")
+    rc, out, e = t.run(["intel", str(t.path("usr/local"))])
+    t.check(rc == 0 and "Old Scan" not in out and "old-tool" in out, f"a <DIR> narrows it: {e}\n{out}")
+
+
+def t_leftovers(t: T) -> None:
+    t.app("Applications/Here.app", "com.example.here")
+    t.write(f"Users/{t.me}/Library/Preferences/com.example.here.plist")
+    gone = t.write(f"Users/{t.me}/Library/Preferences/com.example.gone.plist")
+    t.write(f"Users/{t.me}/Library/Caches/com.apple.Safari/x")
+    for never in ("Logs/parallels.log.1.gz", "Logs/vendor.crash.log", "Preferences/my-tool.suite.30874.plist",
+                  "Group Containers/74J34U3R6X.com.apple.iWork/x", "Preferences/io.twolabels.plist"):
+        t.write(f"Users/{t.me}/Library/{never}")
+    t.write(f"Users/{t.me}/Library/Application Scripts/CH86M498V4.com.example.gonetoo/x")
+    t.plist("Library/LaunchDaemons/org.example.job.plist", {"Label": "org.example.job", "Program": "/x"})
+    t.write("Library/Preferences/org.example.job.plist")
+    rc, out, e = t.run(["leftovers"])
+    t.check(rc == 0, f"rc {rc}: {e}")
+    t.check("com.example.gone.plist" in out and "[com.example.gone]" in out, f"a pref whose app is gone:\n{out}")
+    t.check("[com.example.gonetoo]" in out, f"a team id prefix taken off:\n{out}")
+    for never in ("com.example.here", "com.apple.Safari", "org.example.job", "parallels", "suite.30874", "iWork", "crash.log",
+                  "twolabels"):
+        t.check(never not in out, f"{never} still has its app or job, or is Apple's:\n{out}")
+    t.check(gone.exists(), "look only")
+
+
+BROKEN_PLIST: Final = '<?xml version="1.0"?>\n<plist><dict><key>CFBundleIdentifier</key>\n<string>a & b</string></dict></plist>\n'
+
+
+def t_broken_plists(t: T) -> None:
+    a = t.app("Applications/Good.app", "com.example.good")
+    t.write("Applications/Broken.app/Contents/Info.plist", BROKEN_PLIST)
+    t.write("Library/LaunchDaemons/com.example.broken.plist", BROKEN_PLIST)
+    t.write(f"Users/{t.me}/Library/Preferences/com.example.gone.plist")
+    for args in (["show", str(a)], ["intel"], ["leftovers"]):
+        rc, _, e = t.run(args)
+        t.check(rc == 0, f"{args[0]}: a malformed plist (expat refuses it) is skipped, never a crash: rc {rc}: {e}")
+
+
+def t_config_search_and_offer(t: T) -> None:
+    global _site_conf
+    farm, offer = t.dir / "farm", t.dir / "offer"
+    farm.mkdir()
+    _site_conf = t.dir / "site.conf"
+    _site_conf.write_text(f'CONFIG_SEARCH_DIR="{farm}"\nCONFIG_OFFER_DIR="{offer}"\n'
+                          f'CONFIG_OFFER_NOTE="linked into the farm"\nLOG_BASE_DIR="{t.dir}/logs"\n', encoding="utf-8")
+    old = os.environ.pop("MY_APPCLEANER_CONFIG", None)
+    home = os.environ.get("HOME", "")
+    os.environ["HOME"] = str(t.dir)
+    out, errs = io.StringIO(), io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(errs):
+            rc = main(["intel", str(t.path("usr/local"))])
+        t.check(rc == 1 and f"--create-config > {offer}/{SCRIPT_NAME}.conf   (linked into the farm)" in errs.getvalue()
+                and str(farm) + "/" not in errs.getvalue(), f"no config: the site's offer first, never the farm: {errs.getvalue()}")
+        (farm / f"{SCRIPT_NAME}.GLOBAL").write_text(t.config().read_text(encoding="utf-8"), encoding="utf-8")
+        (farm / SCRIPT_NAME).write_text('VRB="1"\n', encoding="utf-8")
+        out, errs = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(errs):
+            rc = main(["intel", str(t.path("usr/local"))])
+        OUT.__init__()
+        t.check(rc == 0, f"the bare name in the farm, its .GLOBAL first: rc {rc}: {errs.getvalue()}")
+    finally:
+        os.environ["HOME"] = home
+        if old is not None:
+            os.environ["MY_APPCLEANER_CONFIG"] = old
+
+
+def t_site_conf_cannot_tell(t: T) -> None:
+    global _site_conf
+    locked = t.dir / "locked"
+    locked.mkdir()
+    (locked / "site.conf").write_text('LOG_BASE_DIR="/x"\n', encoding="utf-8")
+    locked.chmod(0)
+    _site_conf = locked / "site.conf"
+    try:
+        rc, _, e = t.run(["intel", str(t.path("usr/local"))])
+        t.check(rc == 1 and "cannot read" in e, f"behind a folder it cannot search: an error, not the fallback: {e}")
+    finally:
+        locked.chmod(0o755)
+    _site_conf = t.dir / "dangling.conf"
+    _site_conf.symlink_to(t.dir / "nowhere")
+    rc, _, e = t.run(["intel", str(t.path("usr/local"))])
+    t.check(rc == 1 and "cannot read" in e, f"a link to nothing: an error: {e}")
+
+
+def t_create_config(t: T) -> None:
+    rc, out, _ = t.run(["--create-config"])
+    t.check(rc == 0 and 'PKGUTIL="/usr/sbin/pkgutil"' in out, "the default config to stdout")
+    p = t.dir / "new.conf"
+    rc, _, _ = t.run(["--create-config", str(p)])
+    t.check(rc == 0 and p.is_file(), "into a new file")
+    rc, _, e = t.run(["--create-config", str(p)])
+    t.check(rc == 1 and "never written over" in e, f"never over an existing one: {e}")
+    names: Dict[str, str] = {"LOG_BASE_DIR": "/l", "DATA_BASE_DIR": "/d", "USER": "u"}
+    read_config_text(DEFAULT_CONFIG, "default", names)
+    t.check(names["LOG"] == f"/l/u/{SCRIPT_NAME}.log", f"LOG from site.conf's base: {names['LOG']}")
+
+
+def t_usage(t: T) -> None:
+    for args, want in ((["--intel"], f"you mean `{SCRIPT_NAME} intel`"), (["--bogus"], "no such option"),
+                       (["rm", "go", "/x"], "go is the final word"), (["show", "/x", "go"], "only looks, it takes no go"),
+                       (["rm", "go"], "which <APP>"), (["leftovers", "x"], "takes no argument")):
+        rc, _, e = t.run(args)
+        t.check(rc == 2 and want in e, f"{args}: rc {rc}: {e}")
+    rc, out, _ = t.run(["--help"])
+    t.check(rc == 0 and out.startswith(f"usage: {SCRIPT_NAME} [-Q]"), "--help")
+    rc, out, _ = t.run(["--version"])
+    t.check(rc == 0 and re.match(rf"{SCRIPT_NAME} {SCRIPT_VERSION} \(.+, build [0-9a-f]{{12}}\)", out) is not None, out)
+
+
+def t_quiet(t: T) -> None:
+    global _geteuid
+    p = t.write(f"Users/{t.me}/Library/Preferences/org.example.q.plist")
+    _geteuid = os.getuid
+    rc, _, e = t.run(["-Q", "rm", str(p), "go"])
+    t.check(rc == 0 and e == "", f"-Q: errors only on stderr: {e!r}")
+    p = t.write(f"Users/{t.me}/Library/Preferences/org.example.v.plist")
+    rc, _, e = t.run(["-V", "rm", str(p), "go"])
+    t.check(rc == 0 and f"{p.name} -> " in e and " >>> done:" in e, f"-V adds each move: {e}")
+
+
+def t_unexpected_error(t: T) -> None:
+    real = _verbs["leftovers"]
+
+    def boom(s: Settings, args: Sequence[str]) -> int:
+        raise ValueError("a bug")
+
+    _verbs["leftovers"] = boom
+    try:
+        rc, _, e = t.run(["leftovers"])
+    finally:
+        _verbs["leftovers"] = real
+    m = re.search(r"the trace: (\S+)", e)
+    t.check(rc == 70 and "Traceback" not in e and m is not None, f"rc {rc}: {e}")
+    if m:
+        trace = Path(m.group(1))
+        t.check(trace.is_file() and "ValueError: a bug" in trace.read_text(encoding="utf-8"), "the trace is in its file")
+        trace.unlink(missing_ok=True)
+
+
+def t_ctrl_c(t: T) -> None:
+    t.write("usr/local/bin/x", "MACHO x86_64\n", 0o755)
+    t.table["file-sleep"] = True
+    t.save()
+    env = dict(os.environ, MY_APPCLEANER_TEST_ROOT=str(t.dir))
+    p = subprocess.Popen([sys.executable, os.path.realpath(__file__), "--config", str(t.config()), "intel",
+                          str(t.path("usr/local"))], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True)
+    deadline = time.time() + 20
+    while "file -F" not in t.calls() and time.time() < deadline:
+        time.sleep(0.1)
+    time.sleep(0.3)
+    p.send_signal(signal.SIGINT)
+    _, e = p.communicate(timeout=30)
+    t.check(p.returncode == 130 and "interrupted (Ctrl-C) while typing" in e and "Traceback" not in e,
+            f"rc {p.returncode}: {e}")
+
+
+TESTS: Final[Tuple[Callable[[T], None], ...]] = (
+    t_show_finds_everything, t_bare_app_is_show, t_rm_without_go_changes_nothing, t_rm_go_moves_to_trash,
+    t_needs_root, t_own_library_without_root, t_team_shared_is_kept, t_shared_folder_kept, t_never_removed,
+    t_bundle_and_package_ids, t_loose_program_and_its_job, t_cask_goes_through_brew, t_intel_lists_owners,
+    t_leftovers, t_broken_plists, t_config_search_and_offer, t_site_conf_cannot_tell, t_create_config, t_usage, t_quiet,
+    t_unexpected_error, t_ctrl_c)
+
+
+def run_tests(name_filter: str) -> int:
+    global _geteuid, _completion_on, _site_conf, _root, _kill
+    defined = {n for n in globals() if re.fullmatch(r"t_[a-z0-9_]+", n)}
+    listed = {f.__name__ for f in TESTS}
+    if defined != listed:
+        print(f"Bail out! test functions and TESTS differ: {sorted(defined ^ listed)}")
+        return 1
+    chosen = [f for f in TESTS if name_filter in f.__name__]
+    print(f"1..{len(chosen)}", flush=True)
+    bad, home = 0, Path.cwd()
+    real = (_geteuid, _site_conf, _root, _kill)
+    for k, test in enumerate(chosen, 1):
+        with tempfile.TemporaryDirectory(prefix=f"{SCRIPT_NAME}-tests.") as d:
+            t = T(Path(d).resolve())
+            os.chdir(t.dir)
+            _geteuid, _completion_on = os.getuid, False
+            _site_conf = t.dir / "site.conf"      # the test's own, not the machine's: none until a test writes it
+            _root = t.root
+            try:
+                test(t)
+            except Exception as e:   # a test that crashes fails, and the next one runs
+                t.bad.append(f"crashed: {type(e).__name__}: {e}")
+                t.bad.extend(traceback.format_exc().splitlines())
+            finally:
+                _geteuid, _site_conf, _root, _kill = real
+                _completion_on = True
+                os.chdir(home)
+                OUT.__init__()
+        print(f"{'not ok' if t.bad else 'ok'} {k} - {test.__name__}", flush=True)
+        for b in t.bad:
+            print(f"#   {b}")
+        bad += bool(t.bad)
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    if os.environ.get("MY_APPCLEANER_TEST_ROOT"):      # t_ctrl_c's child: the test's tree, never the machine's
+        _root = Path(os.environ["MY_APPCLEANER_TEST_ROOT"]) / "sys"
+        _site_conf = Path(os.environ["MY_APPCLEANER_TEST_ROOT"]) / "site.conf"
+        _completion_on = False
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    sys.exit(main(sys.argv[1:]))

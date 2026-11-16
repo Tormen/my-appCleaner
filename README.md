@@ -53,7 +53,7 @@ For an app's bundle id, its team id and its installer receipts:
 
 | | where |
 |---|---|
-| the app itself | and any other copy with the same bundle id |
+| the app itself | a bundle id given as `<APP>` names every copy with that id |
 | launchd jobs | `/Library/Launch{Agents,Daemons}`, every `~/Library/LaunchAgents` |
 | helpers | `/Library/PrivilegedHelperTools`; login items are named (macOS forgets them once the item is gone) |
 | extensions | Extensions (kexts), Audio plug-ins, QuickLook, Spotlight, PreferencePanes, Printers, Image Capture, Input Methods, Internet Plug-Ins, Screen Savers, Services |
@@ -65,15 +65,22 @@ Each item says which of these matched it, in brackets:
 - `[bundle id]`: the item's name is the bundle id, or the bundle id followed
   by a dot (`com.example.App.plist`, `com.example.App.savedState`).
 - `[team id]`: the item is signed by the app's team (Group Containers are
-  named after it).
+  named after it). An extension never goes by its team id alone.
 - `[receipt <id>]`: a package installed it.
-- `[program in item]`: a launchd job whose program lies inside an item.
+- `[program in item]`: a launchd job whose program lies inside an item. A
+  job goes with its program, its receipt or its bundle id -- never by team id
+  alone: a job whose program stays is kept.
 
 A name alone matches nothing: too many apps share words like "Scan". The
 other rules exist so that removing one app never takes another's files:
 
-- **A shared team id**: a team id that also signs an app not being removed
-  matches nothing. That app keeps its files, and `show` says so.
+- **Another copy**: an app with the same bundle id that is not named stays
+  (an old version beside a new one), and so do the files of that id. Naming
+  the bundle id itself removes every copy.
+- **A shared team id**: a team id matches only while nothing else it signs
+  stays -- no other app, and no extension (a scanner driver, a kext) that no
+  bundle id or receipt of the removal matched. Those keep what only the team
+  id would have matched, and `show` says so.
 - **A shared folder**: a receipt's file in a folder that also holds files of
   no receipt being removed is kept. Its receipt is then not forgotten.
 - **Never removed**: macOS's own files (`/System`, `com.apple.*`), a folder

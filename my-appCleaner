@@ -759,7 +759,7 @@ class Job:
 # --- 3. the plan -----------------------------------------------------------
 
 Section = Literal["apps", "items", "launchd", "helpers", "extensions", "library", "receipts"]
-WhyKind = Literal["given", "in the folder", "same bundle id", "bundle id", "team id", "receipt", "program in item",
+WhyKind = Literal["given", "in the folder", "bundle id", "team id", "receipt", "program in item",
                   "inside item"]
 
 
@@ -853,7 +853,8 @@ class Plan:
     bundle_ids: Set[str] = field(default_factory=lambda: set())
     short_ids: Set[str] = field(default_factory=lambda: set())
     teams: Set[str] = field(default_factory=lambda: set())
-    team_kept: Dict[str, List[Path]] = field(default_factory=lambda: {})     # team -> other apps it signs
+    team_kept: Dict[str, List[Path]] = field(default_factory=lambda: {})     # team -> what else it signs, staying
+    id_kept: Dict[str, List[Path]] = field(default_factory=lambda: {})       # bundle id -> other copies, staying
     team_kept_items: List[Path] = field(default_factory=lambda: [])
     casks: Dict[str, Path] = field(default_factory=lambda: {})
     login_items: List[Path] = field(default_factory=lambda: [])
@@ -928,11 +929,14 @@ def make_plan(sysm: System, args: Sequence[str]) -> Plan:
         team = sysm.team(app)
         if team:
             plan.teams.add(team)
+    # another copy with the same bundle id is not removed unless it is named
+    # (a path, or the bundle id itself): it stays, and so do the files of that id
     for other in sysm.installed_apps():
-        if other not in plan.items and bundle_id(other).lower() in plan.bundle_ids | plan.short_ids:
-            plan.add(other, "apps", Why("same bundle id"))
-    _team_guard(sysm, plan)
-    teams = plan.teams - set(plan.team_kept)
+        bid = bundle_id(other).lower()
+        if other not in plan.items and bid in plan.bundle_ids | plan.short_ids:
+            plan.id_kept.setdefault(bid, []).append(other)
+    plan.bundle_ids -= set(plan.id_kept)
+    plan.short_ids -= set(plan.id_kept)
 
     for app, token in ((a, sysm.casks().get(a)) for a in plan.apps()):
         if token:
@@ -949,8 +953,19 @@ def make_plan(sysm: System, args: Sequence[str]) -> Plan:
         if rid not in receipts:
             receipts[rid] = sysm.receipt_of(rid)
     _receipt_items(plan, [receipts[i] for i in plan.receipts])
+    libs = [R("Library")] + [x.path / "Library" for x in hs]
+    _team_guard(sysm, plan, libs)
+    teams = plan.teams - set(plan.team_kept)
 
-    phase("matching launchd jobs, helpers, extensions and Library files")
+    phase("matching helpers, extensions, launchd jobs and Library files")
+    for h in listdir(R(HELPER_DIR)):
+        _match_bundle(sysm, plan, h, "helpers", teams)
+    for lib in libs:
+        for d in EXTENSION_DIRS:
+            for e in listdir(lib / d):
+                _match_bundle(sysm, plan, e, "extensions", teams)
+    # a job goes with its program, its receipt or its id -- never by team id
+    # alone: a job whose program stays would be left pointing at nothing removed
     item_roots = list(plan.items)
     receipt_files = {f for i in plan.receipts for f in receipts[i].files}
     for job in sysm.jobs():
@@ -961,18 +976,11 @@ def make_plan(sysm: System, args: Sequence[str]) -> Plan:
             why = Why("receipt")
         elif id_match(job.label, plan.bundle_ids) or id_match(job.plist.name, plan.bundle_ids):
             why = Why("bundle id")
-        elif teams and job.program is not None and job.program.exists() and sysm.team(job.program) in teams:
-            why = Why("team id", sysm.team(job.program))
         if why is not None:
             where, running = sysm.loaded(job)
             plan.jobs[job.plist] = (job, why, where, running)
             plan.add(job.plist, "launchd", why)
-    for h in listdir(R(HELPER_DIR)):
-        _match_bundle(sysm, plan, h, "helpers", teams)
-    for lib in [R("Library")] + [x.path / "Library" for x in hs]:
-        for d in EXTENSION_DIRS:
-            for e in listdir(lib / d):
-                _match_bundle(sysm, plan, e, "extensions", teams)
+    for lib in libs:
         for d in LIBRARY_DIRS:
             for e in listdir(lib / d):
                 if e.is_dir() and e.name == "ByHost":
@@ -994,15 +1002,21 @@ def make_plan(sysm: System, args: Sequence[str]) -> Plan:
     return plan
 
 
-def _team_guard(sysm: System, plan: Plan) -> None:
-    """A team id signs more than the apps given: the other apps it signs keep
-    what only the team id would have matched."""
+def _team_guard(sysm: System, plan: Plan, libs: Sequence[Path]) -> None:
+    """A team id signs more than what is removed: an app, or an extension (a
+    driver, a kext, a plug-in), that stays keeps what only the team id would
+    have matched. An extension that stays is one no bundle id or receipt of the
+    removal matched -- so a team id never removes an extension on its own."""
     if not plan.teams:
         return
-    phase("checking which other apps the team ids sign")
-    for other in sysm.installed_apps():
-        if other in plan.items:
-            continue
+    phase("checking what else the team ids sign")
+    roots = list(plan.items)
+    others = [a for a in sysm.installed_apps() if not inside(a, roots)]
+    for lib in libs:
+        for d in EXTENSION_DIRS:
+            others += [e for e in listdir(lib / d) if BUNDLE_EXT.search(e.name) and not inside(e, roots)
+                       and not id_match(e.name, plan.bundle_ids) and not id_match(bundle_id(e), plan.bundle_ids)]
+    for other in others:
         t = sysm.team(other)
         if t in plan.teams:
             plan.team_kept.setdefault(t, []).append(other)
@@ -1151,9 +1165,13 @@ def print_plan(plan: Plan) -> None:
                 OUT.result(f"   > {rid}: {len(files)} path(s) kept, e.g. {home_label(files[0], hs)}")
         else:
             OUT.result(f" >>> receipts: {len(plan.receipts)} package(s), all their files covered above")
+    for bid, copies in sorted(plan.id_kept.items()):
+        OUT.result(f" >>> bundle id {bid} is also the id of {len(copies)} app{'s' if len(copies) > 1 else ''} that "
+                   f"stay{'' if len(copies) > 1 else 's'} -- its files are kept, e.g. {home_label(copies[0], hs)} "
+                   f"(name the bundle id to remove every copy)")
     for team, others2 in sorted(plan.team_kept.items()):
-        OUT.result(f" >>> team id {team} also signs {len(others2)} other app(s) -- kept what only it matched "
-                   f"({len(plan.team_kept_items)}), e.g. {home_label(others2[0], hs)}")
+        OUT.result(f" >>> team id {team} also signs {len(others2)} other app(s) or extension(s) that stay -- kept "
+                   f"what only it matched ({len(plan.team_kept_items)}), e.g. {home_label(others2[0], hs)}")
         for p in plan.team_kept_items:
             OUT.det(f"    > kept: {home_label(p, hs)}")
     for b in sorted(plan.short_ids):
@@ -1602,7 +1620,7 @@ in it), or any other path `intel` lists -- a loose program, a kext, a folder:
 then it, its receipt and its launchd jobs.
 
 What it looks at, for an app's bundle id, its team id and its receipts:
-  the app itself                   and any other copy with the same bundle id
+  the app itself                   (a bundle id names every copy with that id)
   launchd jobs                     /Library/Launch{{Agents,Daemons}}, every ~/Library/LaunchAgents
   helpers                          /Library/PrivilegedHelperTools; login items are named
                                    (macOS forgets them once the item is gone)
@@ -1615,8 +1633,12 @@ What it looks at, for an app's bundle id, its team id and its receipts:
   installer receipts               pkgutil: every file the package installed, then --forget
 Each item says which of these matched it: the bundle id, the team id, a receipt,
 or a launchd job's program inside the item. A name alone matches nothing (too many
-apps share words like "Scan"). A team id that also signs an app not being removed
-matches nothing: that app keeps its files. A receipt's file in a folder that also
+apps share words like "Scan"). Another copy with the same bundle id stays unless
+named, and keeps the files of that id. A team id matches only while nothing else
+it signs stays -- no other app, no extension (a driver, a kext): those keep the
+files only the team id matched, and an extension goes only by its bundle id or a
+receipt. A launchd job goes with its program, receipt or id, never by team id
+alone. A receipt's file in a folder that also
 holds files of no receipt being removed is kept, and its receipt not forgotten.
 Never removed: macOS's own (/System, com.apple.*), a folder things are installed
 into (/Applications, /Library/Preferences, a home, ...) or anything holding one.
@@ -2123,6 +2145,47 @@ def t_team_shared_is_kept(t: T) -> None:
     t.check(g.exists(), "nothing changed")
 
 
+def t_same_id_copy_kept(t: T) -> None:
+    old = t.app("Applications/Draw.app", "com.vendor.draw")
+    new = t.app("Applications/Vendor Draw.app", "com.vendor.draw")          # another version, kept
+    pref = t.write(f"Users/{t.me}/Library/Preferences/com.vendor.draw.plist")
+    rc, out, e = t.run(["show", str(old)])
+    t.check(rc == 0, f"rc {rc}: {e}")
+    t.check("Vendor Draw.app" not in out.split(" >>> bundle id")[0], f"a copy not given is not removed:\n{out}")
+    t.check("com.vendor.draw.plist" not in out.split(" >>> bundle id")[0], f"nor the files the copy uses:\n{out}")
+    t.check("bundle id com.vendor.draw is also the id of 1 app that stays" in out, f"and says so:\n{out}")
+    global _geteuid
+    _geteuid = lambda: 0
+    rc, _, e = t.run(["rm", str(old), "go"])
+    t.check(rc == 0 and t.trashed("Draw.app") and new.exists() and pref.exists(), f"rm takes the given copy only: {e}")
+    t.app("Applications/Draw.app", "com.vendor.draw")
+    rc, out, e = t.run(["show", "com.vendor.draw"])
+    t.check(rc == 0 and "Vendor Draw.app" in out and "com.vendor.draw.plist" in out,
+            f"a bundle id names every copy, and its files:\n{out}")
+
+
+def t_team_extension_kept(t: T) -> None:
+    a = t.app("Applications/Vendor Scan.app", "com.vendor.scan", "TEAMDRV")
+    scanner = t.app("Library/Image Capture/Devices/Vendor Scanner.app", "com.vendor.scanmodule", "TEAMDRV")
+    kext = t.app("Library/Extensions/vendor_io.kext", "com.vendor.kext.io", "TEAMDRV")
+    g = t.write(f"Users/{t.me}/Library/Group Containers/TEAMDRV.scan/x")
+    mon = t.app("Library/Printers/vendor/Monitor.app", "com.vendor.monitor", "TEAMDRV")
+    job = t.plist(f"Users/{t.me}/Library/LaunchAgents/com.vendor.devicemonitor.plist",
+                  {"Label": "com.vendor.devicemonitor", "ProgramArguments": [shown(mon / "Contents/MacOS/Monitor")]})
+    t.answer("codesign", f"-dv {mon / 'Contents/MacOS/Monitor'}", "TeamIdentifier=TEAMDRV\n")
+    rc, out, e = t.run(["show", str(a)])
+    t.check(rc == 0, f"rc {rc}: {e}")
+    plan = out.split(" >>> team id TEAMDRV also")[0]
+    for kept in ("Vendor Scanner.app", "vendor_io.kext", "TEAMDRV.scan", "com.vendor.devicemonitor"):
+        t.check(kept not in plan, f"{kept}: a team id never takes a driver the team ships, nor what it may use:\n{out}")
+    t.check("team id TEAMDRV also signs 2 other app(s) or extension(s) that stay" in out, f"and says so:\n{out}")
+    rc, out, e = t.run(["show", str(a), str(scanner), str(kext)])
+    t.check(rc == 0 and "TEAMDRV.scan" in out and "[team id TEAMDRV]" in out,
+            f"with nothing of the team left, its id matches:\n{out}")
+    t.check("com.vendor.devicemonitor" not in out, f"a job whose program stays is kept, whatever signs it:\n{out}")
+    t.check(g.exists() and job.exists(), "nothing changed")
+
+
 def t_shared_folder_kept(t: T) -> None:
     a = t.app("Applications/Tool.app", "com.vendor.tool")
     t.write("Library/Application Support/Vendor/tool.dat")
@@ -2376,7 +2439,7 @@ def t_ctrl_c(t: T) -> None:
 
 TESTS: Final[Tuple[Callable[[T], None], ...]] = (
     t_show_finds_everything, t_bare_app_is_show, t_rm_without_go_changes_nothing, t_rm_go_moves_to_trash,
-    t_needs_root, t_own_library_without_root, t_team_shared_is_kept, t_shared_folder_kept, t_never_removed,
+    t_needs_root, t_own_library_without_root, t_team_shared_is_kept, t_same_id_copy_kept, t_team_extension_kept, t_shared_folder_kept, t_never_removed,
     t_bundle_and_package_ids, t_loose_program_and_its_job, t_cask_goes_through_brew, t_intel_lists_owners,
     t_leftovers, t_broken_plists, t_config_search_and_offer, t_site_conf_cannot_tell, t_create_config, t_usage, t_quiet,
     t_unexpected_error, t_ctrl_c)
